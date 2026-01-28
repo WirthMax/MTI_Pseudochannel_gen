@@ -110,13 +110,21 @@ class PseudochannelExplorer:
         self._zoom_region = None  # (x1, y1, x2, y2) in preview coords
         self._zoom_output = None  # Output widget for zoomed view
         self._rect_selector = None  # RectangleSelector instance
-        self._fig = None  # Figure reference
-        self._ax = None  # Axes reference
+
+        # Figure references (created once, reused)
+        self._preview_fig = None
+        self._preview_ax = None
+        self._preview_img = None  # AxesImage object for set_data()
+        self._preview_is_rgb = False  # Track if current image is RGB
+
+        self._zoom_fig = None
+        self._zoom_ax = None
+        self._zoom_img = None
+        self._zoom_is_rgb = False
 
         # Nuclear marker overlay state
         self.nuclear_marker = None  # Full-res nuclear marker array
         self.nuclear_preview = None  # Downsampled nuclear marker
-        self._show_nuclear = False  # Toggle state
 
         # Store original channels input and marker info for OME-TIFF auto-detection
         self._original_channels_input = channels
@@ -404,10 +412,22 @@ class PseudochannelExplorer:
 
         return (full_x1, full_y1, full_x2, full_y2)
 
+    def _create_zoom_figure(self):
+        """Create the zoom figure once (lazily on first zoom)."""
+        with self._zoom_output:
+            self._zoom_fig, self._zoom_ax = plt.subplots(figsize=(6, 6))
+            self._zoom_ax.axis("off")
+            plt.tight_layout()
+            plt.show()
+
     def _update_zoom_view(self):
         """Compute and display zoomed region at full resolution."""
         if self._zoom_region is None:
             return
+
+        # Create zoom figure if it doesn't exist
+        if self._zoom_fig is None:
+            self._create_zoom_figure()
 
         # Get full-resolution coordinates
         full_coords = self._preview_to_full_coords(self._zoom_region)
@@ -428,83 +448,66 @@ class PseudochannelExplorer:
             normalize=normalize,
         )
 
-        # Display zoomed region
-        with self._zoom_output:
-            self._zoom_output.clear_output(wait=True)
+        # Determine if we need RGB or grayscale
+        use_rgb = (
+            self.nuclear_toggle.value
+            and self.nuclear_marker is not None
+        )
 
-            # Use fixed 6x6 figure size to match preview (side by side layout)
-            fig, ax = plt.subplots(figsize=(6, 6))
+        if use_rgb:
+            nuclear_region = self.nuclear_marker[y1:y2, x1:x2]
+            pseudo_norm = zoomed_pseudochannel
+            nuclear_norm = self._normalize_nuclear(nuclear_region)
+            data = np.stack([pseudo_norm, pseudo_norm, nuclear_norm], axis=-1)
+        else:
+            data = zoomed_pseudochannel
 
-            # Check if nuclear overlay is enabled
-            if (
-                self.nuclear_toggle.value
-                and self.nuclear_marker is not None
-            ):
-                # Extract nuclear region at full resolution
-                nuclear_region = self.nuclear_marker[y1:y2, x1:x2]
-
-                # Create RGB composite
-                pseudo_norm = zoomed_pseudochannel
-                nuclear_norm = self._normalize_nuclear(nuclear_region)
-
-                rgb = np.stack([
-                    pseudo_norm,   # R
-                    pseudo_norm,   # G
-                    nuclear_norm   # B
-                ], axis=-1)
-                ax.imshow(rgb)
+        # Check if we need to recreate the image (RGB <-> grayscale switch or first time)
+        if self._zoom_img is None or use_rgb != self._zoom_is_rgb:
+            self._zoom_ax.clear()
+            self._zoom_ax.axis("off")
+            if use_rgb:
+                self._zoom_img = self._zoom_ax.imshow(data)
             else:
-                ax.imshow(zoomed_pseudochannel, cmap=self.cmap_dropdown.value)
+                self._zoom_img = self._zoom_ax.imshow(
+                    data, cmap=self.cmap_dropdown.value, vmin=0, vmax=1
+                )
+            self._zoom_is_rgb = use_rgb
+        else:
+            self._zoom_img.set_data(data)
+            if not use_rgb:
+                self._zoom_img.set_cmap(self.cmap_dropdown.value)
+            # Update extent for new region size
+            self._zoom_img.set_extent([0, data.shape[1], data.shape[0], 0])
 
-            ax.axis("off")
-            plt.tight_layout()
-            plt.show()
+        self._zoom_fig.canvas.draw_idle()
 
     def _on_reset_zoom(self, button):
         """Clear zoom region and reset view."""
         self._zoom_region = None
-        with self._zoom_output:
-            self._zoom_output.clear_output()
+        if self._zoom_fig is not None:
+            self._zoom_ax.clear()
+            self._zoom_ax.axis("off")
+            self._zoom_img = None
+            self._zoom_fig.canvas.draw_idle()
 
-    def _update_preview(self):
-        """Update the preview image based on current slider values."""
-        weights = get_weights_from_sliders(self.sliders)
-        normalize = self.normalize_dropdown.value
-
-        pseudochannel = compute_pseudochannel(
-            self.previews,
-            weights,
-            normalize=normalize,
-        )
-
+    def _create_preview_figure(self):
+        """Create the preview figure once."""
         with self.output:
-            self.output.clear_output(wait=True)
+            self._preview_fig, self._preview_ax = plt.subplots(figsize=(6, 6))
+            self._preview_ax.axis("off")
 
-            self._fig, self._ax = plt.subplots(figsize=(6, 6))
+            # Create initial blank image
+            preview_shape = next(iter(self.previews.values())).shape
+            blank = np.zeros(preview_shape, dtype=np.float32)
+            self._preview_img = self._preview_ax.imshow(
+                blank, cmap=self.cmap_dropdown.value, vmin=0, vmax=1
+            )
+            self._preview_is_rgb = False
 
-            # Check if nuclear overlay is enabled
-            if (
-                self.nuclear_toggle.value
-                and self.nuclear_preview is not None
-            ):
-                # Create RGB composite: pseudo in red+green (yellow), nuclear in blue
-                pseudo_norm = pseudochannel  # Already 0-1 from compute_pseudochannel
-                nuclear_norm = self._normalize_nuclear(self.nuclear_preview)
-
-                rgb = np.stack([
-                    pseudo_norm,   # R
-                    pseudo_norm,   # G
-                    nuclear_norm   # B
-                ], axis=-1)
-                self._ax.imshow(rgb)
-            else:
-                self._ax.imshow(pseudochannel, cmap=self.cmap_dropdown.value)
-
-            self._ax.axis("off")
-
-            # Add RectangleSelector for zoom functionality
+            # Add RectangleSelector for zoom functionality (only once)
             self._rect_selector = RectangleSelector(
-                self._ax,
+                self._preview_ax,
                 self._on_rectangle_select,
                 useblit=True,
                 button=[1],  # Left click only
@@ -517,14 +520,73 @@ class PseudochannelExplorer:
             plt.tight_layout()
             plt.show()
 
+    def _update_preview(self):
+        """Update the preview image based on current slider values."""
+        weights = get_weights_from_sliders(self.sliders)
+        normalize = self.normalize_dropdown.value
+
+        pseudochannel = compute_pseudochannel(
+            self.previews,
+            weights,
+            normalize=normalize,
+        )
+
+        # Determine if we need RGB or grayscale
+        use_rgb = (
+            self.nuclear_toggle.value
+            and self.nuclear_preview is not None
+        )
+
+        if use_rgb:
+            # Create RGB composite: pseudo in red+green (yellow), nuclear in blue
+            pseudo_norm = pseudochannel
+            nuclear_norm = self._normalize_nuclear(self.nuclear_preview)
+            data = np.stack([pseudo_norm, pseudo_norm, nuclear_norm], axis=-1)
+        else:
+            data = pseudochannel
+
+        # Check if we need to recreate the image (RGB <-> grayscale switch)
+        if self._preview_img is None or use_rgb != self._preview_is_rgb:
+            # Need to recreate the image
+            self._preview_ax.clear()
+            self._preview_ax.axis("off")
+            if use_rgb:
+                self._preview_img = self._preview_ax.imshow(data)
+            else:
+                self._preview_img = self._preview_ax.imshow(
+                    data, cmap=self.cmap_dropdown.value, vmin=0, vmax=1
+                )
+            self._preview_is_rgb = use_rgb
+
+            # Recreate RectangleSelector after clearing axes
+            self._rect_selector = RectangleSelector(
+                self._preview_ax,
+                self._on_rectangle_select,
+                useblit=True,
+                button=[1],
+                minspanx=5,
+                minspany=5,
+                interactive=True,
+                props=dict(facecolor="cyan", alpha=0.3),
+            )
+        else:
+            # Just update the data
+            self._preview_img.set_data(data)
+            if not use_rgb:
+                self._preview_img.set_cmap(self.cmap_dropdown.value)
+
+        # Refresh the canvas
+        self._preview_fig.canvas.draw_idle()
+
         # Update zoom view if region is selected
         if self._zoom_region is not None:
             self._update_zoom_view()
 
     def display(self):
         """Display the interactive widget."""
-        self._update_preview()
         display(self.main_widget)
+        self._create_preview_figure()
+        self._update_preview()
 
     def get_weights(self) -> dict[str, float]:
         """Get current weight configuration."""
@@ -536,6 +598,19 @@ class PseudochannelExplorer:
             if name in self.sliders:
                 self.sliders[name].value = value
         self._update_preview()
+
+    def close(self):
+        """Close figures and clean up resources."""
+        if self._preview_fig is not None:
+            plt.close(self._preview_fig)
+            self._preview_fig = None
+            self._preview_ax = None
+            self._preview_img = None
+        if self._zoom_fig is not None:
+            plt.close(self._zoom_fig)
+            self._zoom_fig = None
+            self._zoom_ax = None
+            self._zoom_img = None
 
 
 def create_interactive_explorer(
