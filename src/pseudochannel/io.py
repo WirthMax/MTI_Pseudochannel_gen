@@ -48,33 +48,50 @@ def _should_exclude_channel(
     return any(excl.lower() == channel_lower for excl in exclude_set)
 
 
-# Regex pattern to extract marker name from filenames like:
+# Default regex pattern for MACSima filenames:
 # C-000_S-000_AFB_APC_R-01_W-A-1_ROI-08_A-None.tif -> "None"
 # C-001_S-000_S_APC_R-01_W-A-1_ROI-08_A-VG_C-234TCR.tif -> "VG_C-234TCR"
-_MARKER_NAME_PATTERN = re.compile(r"_A-([^.]+)$")
+# The marker name follows "_A-" and continues until the file extension
+MACSIMA_PATTERN = r"_A-([^.]+)$"
+
+# Compiled default pattern
+_DEFAULT_MARKER_PATTERN = re.compile(MACSIMA_PATTERN)
 
 
-def parse_channel_name(filename: str) -> str:
+def parse_channel_name(
+    filename: str,
+    pattern: Optional[Union[str, re.Pattern]] = None,
+) -> str:
     """Extract marker/channel name from filename.
 
-    Supports two naming conventions:
-    1. Complex filenames with '_A-<marker>' suffix:
-       'C-000_S-000_AFB_APC_R-01_W-A-1_ROI-08_A-None.tif' -> 'None'
-       'C-001_S-000_S_APC_R-01_W-A-1_ROI-08_A-CD45_C-REA123.tif' -> 'CD45_C-REA123'
-    2. Simple filenames where stem is the marker name:
-       'CD45.tif' -> 'CD45'
-       'DAPI_channel.tiff' -> 'DAPI_channel'
+    By default uses the MACSima naming convention where marker names
+    follow '_A-' in the filename. Custom patterns can be provided for
+    other instruments.
 
     Args:
         filename: The filename (with or without path)
+        pattern: Optional regex pattern with one capture group for the marker name.
+            Can be a string or compiled re.Pattern. If None, uses MACSima pattern.
+            Examples:
+                r"_A-([^.]+)$"           - MACSima (default)
+                r"^([^_]+)_"             - Marker at start before first underscore
+                r"_channel_([^_]+)_"     - Marker after '_channel_'
 
     Returns:
         Extracted marker/channel name
     """
     stem = Path(filename).stem
 
-    # Try to match the _A-<marker> pattern
-    match = _MARKER_NAME_PATTERN.search(stem)
+    # Compile pattern if string
+    if pattern is None:
+        compiled = _DEFAULT_MARKER_PATTERN
+    elif isinstance(pattern, str):
+        compiled = re.compile(pattern)
+    else:
+        compiled = pattern
+
+    # Try to match the pattern
+    match = compiled.search(stem)
     if match:
         return match.group(1)
 
@@ -87,6 +104,7 @@ def load_channel_folder(
     extensions: tuple[str, ...] = (".tif", ".tiff"),
     use_memmap: bool = True,
     exclude_channels: set[str] | list[str] | None = None,
+    marker_pattern: Optional[Union[str, re.Pattern]] = None,
 ) -> dict[str, np.ndarray]:
     """Load all channel TIFFs from folder.
 
@@ -97,6 +115,9 @@ def load_channel_folder(
         exclude_channels: Channel names to exclude (case-insensitive).
             If None, uses DEFAULT_EXCLUDED_CHANNELS.
             Pass empty set/list to include all channels.
+        marker_pattern: Regex pattern to extract marker name from filename.
+            Must contain one capture group. If None, uses MACSima pattern.
+            See parse_channel_name() for examples.
 
     Returns:
         Dict mapping channel_name -> array (memory-mapped if use_memmap=True)
@@ -124,7 +145,7 @@ def load_channel_folder(
         raise ValueError(f"No TIFF files found in {folder_path}")
 
     for tiff_file in tiff_files:
-        channel_name = parse_channel_name(tiff_file.name)
+        channel_name = parse_channel_name(tiff_file.name, pattern=marker_pattern)
 
         # Skip excluded channels
         if _should_exclude_channel(channel_name, exclude_channels):

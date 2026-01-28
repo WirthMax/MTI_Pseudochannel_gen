@@ -9,6 +9,7 @@ This package provides tools for:
 
 from .io import (
     DEFAULT_EXCLUDED_CHANNELS,
+    MACSIMA_PATTERN,
     load_channel_folder,
     load_marker_names,
     load_ome_tiff,
@@ -24,6 +25,7 @@ __version__ = "0.1.0"
 
 __all__ = [
     "DEFAULT_EXCLUDED_CHANNELS",
+    "MACSIMA_PATTERN",
     "load_channel_folder",
     "load_marker_names",
     "load_ome_tiff",

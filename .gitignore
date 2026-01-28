@@ -3,6 +3,9 @@ __pycache__/
 *.py[codz]
 *$py.class
 
+#specific
+output/*
+
 # C extensions
 *.so
 
@@ -193,6 +196,8 @@ cython_debug/
 
 # PyPI configuration file
 .pypirc
+.claude/*
+*CLAUDE.md
 
 # Cursor
 #  Cursor is an AI-powered code editor. `.cursorignore` specifies files/directories to
