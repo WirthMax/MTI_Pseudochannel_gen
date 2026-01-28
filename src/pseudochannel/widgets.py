@@ -79,6 +79,7 @@ class PseudochannelExplorer:
         debounce_ms: int = 100,
         exclude_channels: set[str] | list[str] | None = None,
         nuclear_marker_path: Optional[Union[str, Path]] = None,
+        max_zoom_size: int = 1024,
     ):
         """Initialize the explorer.
 
@@ -98,10 +99,13 @@ class PseudochannelExplorer:
             nuclear_marker_path: Path to nuclear marker TIFF file (e.g., DAPI).
                 If provided, enables nuclear overlay toggle. For OME-TIFF input,
                 the DAPI channel will be auto-detected if not specified.
+            max_zoom_size: Maximum size for zoom region. Larger regions will be
+                downsampled for faster display.
         """
         self.preview_size = preview_size
         self.debounce_ms = debounce_ms
         self.exclude_channels = exclude_channels
+        self.max_zoom_size = max_zoom_size
 
         self._last_update_time = 0
         self._pending_update = False
@@ -421,7 +425,7 @@ class PseudochannelExplorer:
             plt.show()
 
     def _update_zoom_view(self):
-        """Compute and display zoomed region at full resolution."""
+        """Compute and display zoomed region with optimizations."""
         if self._zoom_region is None:
             return
 
@@ -433,20 +437,44 @@ class PseudochannelExplorer:
         full_coords = self._preview_to_full_coords(self._zoom_region)
         x1, y1, x2, y2 = full_coords
 
-        # Extract full-resolution region from each channel
+        # Calculate region size and downsample factor if needed
+        region_height = y2 - y1
+        region_width = x2 - x1
+        max_dim = max(region_height, region_width)
+
+        if max_dim > self.max_zoom_size:
+            # Downsample for speed
+            scale = self.max_zoom_size / max_dim
+            step = max(1, int(1 / scale))
+        else:
+            step = 1
+
+        # Get current weights - only process channels with non-zero weights
+        weights = get_weights_from_sliders(self.sliders)
+        active_weights = {k: v for k, v in weights.items() if v > 0}
+
+        # Extract regions only for active channels (with stride for large regions)
         zoom_channels = {}
-        for name, channel in self.channels.items():
-            zoom_channels[name] = channel[y1:y2, x1:x2]
+        for name in active_weights:
+            if name in self.channels:
+                region = self.channels[name][y1:y2:step, x1:x2:step]
+                zoom_channels[name] = region.astype(np.float32)
 
         # Compute pseudochannel for zoomed region
-        weights = get_weights_from_sliders(self.sliders)
         normalize = self.normalize_dropdown.value
 
-        zoomed_pseudochannel = compute_pseudochannel(
-            zoom_channels,
-            weights,
-            normalize=normalize,
-        )
+        if zoom_channels:
+            zoomed_pseudochannel = compute_pseudochannel(
+                zoom_channels,
+                active_weights,
+                normalize=normalize,
+            )
+        else:
+            # No active channels - show zeros
+            zoomed_pseudochannel = np.zeros(
+                ((y2 - y1) // step or 1, (x2 - x1) // step or 1),
+                dtype=np.float32
+            )
 
         # Determine if we need RGB or grayscale
         use_rgb = (
@@ -455,30 +483,24 @@ class PseudochannelExplorer:
         )
 
         if use_rgb:
-            nuclear_region = self.nuclear_marker[y1:y2, x1:x2]
+            nuclear_region = self.nuclear_marker[y1:y2:step, x1:x2:step]
             pseudo_norm = zoomed_pseudochannel
             nuclear_norm = self._normalize_nuclear(nuclear_region)
             data = np.stack([pseudo_norm, pseudo_norm, nuclear_norm], axis=-1)
         else:
             data = zoomed_pseudochannel
 
-        # Check if we need to recreate the image (RGB <-> grayscale switch or first time)
-        if self._zoom_img is None or use_rgb != self._zoom_is_rgb:
-            self._zoom_ax.clear()
-            self._zoom_ax.axis("off")
-            if use_rgb:
-                self._zoom_img = self._zoom_ax.imshow(data)
-            else:
-                self._zoom_img = self._zoom_ax.imshow(
-                    data, cmap=self.cmap_dropdown.value, vmin=0, vmax=1
-                )
-            self._zoom_is_rgb = use_rgb
+        # Always recreate image when data shape changes (new rectangle)
+        # This ensures clean updates
+        self._zoom_ax.clear()
+        self._zoom_ax.axis("off")
+        if use_rgb:
+            self._zoom_img = self._zoom_ax.imshow(data)
         else:
-            self._zoom_img.set_data(data)
-            if not use_rgb:
-                self._zoom_img.set_cmap(self.cmap_dropdown.value)
-            # Update extent for new region size
-            self._zoom_img.set_extent([0, data.shape[1], data.shape[0], 0])
+            self._zoom_img = self._zoom_ax.imshow(
+                data, cmap=self.cmap_dropdown.value, vmin=0, vmax=1
+            )
+        self._zoom_is_rgb = use_rgb
 
         self._zoom_fig.canvas.draw_idle()
 
@@ -620,6 +642,7 @@ def create_interactive_explorer(
     preview_size: int = 512,
     exclude_channels: set[str] | list[str] | None = None,
     nuclear_marker_path: Optional[Union[str, Path]] = None,
+    max_zoom_size: int = 1024,
 ) -> PseudochannelExplorer:
     """Main function to create and display the interactive explorer.
 
@@ -638,6 +661,8 @@ def create_interactive_explorer(
         nuclear_marker_path: Path to nuclear marker TIFF file (e.g., DAPI).
             If provided, enables nuclear overlay toggle. For OME-TIFF input,
             the DAPI channel will be auto-detected if not specified.
+        max_zoom_size: Maximum size for zoom region display. Larger regions
+            will be downsampled for faster rendering.
 
     Returns:
         PseudochannelExplorer instance
@@ -678,6 +703,7 @@ def create_interactive_explorer(
         preview_size=preview_size,
         exclude_channels=exclude_channels,
         nuclear_marker_path=nuclear_marker_path,
+        max_zoom_size=max_zoom_size,
     )
     explorer.display()
     return explorer
