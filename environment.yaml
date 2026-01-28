@@ -48,6 +48,7 @@ dependencies:
   - idna=3.11=py314h06a4308_0
   - intel-openmp=2025.0.0=h06a4308_1171
   - ipykernel=6.31.0=py314h6fa48dc_0
+  - ipympl
   - ipython=9.7.0=py314h06a4308_0
   - ipython_pygments_lexers=1.1.1=py314h06a4308_0
   - ipywidgets=8.1.7=py314h06a4308_0
