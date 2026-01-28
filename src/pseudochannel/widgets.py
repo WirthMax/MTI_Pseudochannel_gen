@@ -47,8 +47,8 @@ def create_weight_sliders(
             orientation="horizontal",
             readout=True,
             readout_format=".2f",
-            style={"description_width": "120px"},
-            layout=widgets.Layout(width="400px"),
+            style={"description_width": "100px"},
+            layout=widgets.Layout(width="280px"),
         )
         sliders[name] = slider
 
@@ -268,15 +268,16 @@ class PseudochannelExplorer:
             self.reset_zoom_button,
         ])
 
+        # Main row: sliders | preview | zoom (aligned at top)
+        main_row = widgets.HBox(
+            [slider_box, self.output, self._zoom_output],
+            layout=widgets.Layout(align_items="flex-start"),
+        )
+
         self.main_widget = widgets.VBox([
             widgets.HTML("<h3>Pseudochannel Weight Tuning</h3>"),
-            widgets.HBox([
-                slider_box,
-                self.output,
-            ]),
             controls,
-            self._zoom_label,
-            self._zoom_output,
+            main_row,
         ])
 
     def _on_slider_change(self, change):
@@ -305,15 +306,15 @@ class PseudochannelExplorer:
         n_sliders = len(sliders)
 
         # Determine number of columns based on slider count
-        if n_sliders >= 30:
+        if n_sliders >= 20:
             n_cols = 3
-        elif n_sliders >= 15:
+        elif n_sliders >= 10:
             n_cols = 2
         else:
             n_cols = 1
 
         # Adjust slider width for multi-column layout
-        slider_width = "250px" if n_cols > 1 else "400px"
+        slider_width = "280px"
         for slider in sliders:
             slider.layout.width = slider_width
 
@@ -331,11 +332,8 @@ class PseudochannelExplorer:
         return widgets.HBox(columns, layout=widgets.Layout(padding="10px"))
 
     def _setup_extra_widgets(self):
-        """Create zoom output widget, reset button, nuclear toggle, and info label."""
+        """Create zoom output widget, reset button, and nuclear toggle."""
         self._zoom_output = widgets.Output()
-        self._zoom_label = widgets.HTML(
-            value="<h4>Zoom View</h4><i>Draw a rectangle on the preview to zoom</i>"
-        )
 
         self.reset_zoom_button = widgets.Button(
             description="Reset Zoom",
@@ -415,14 +413,6 @@ class PseudochannelExplorer:
         full_coords = self._preview_to_full_coords(self._zoom_region)
         x1, y1, x2, y2 = full_coords
 
-        # Update label with region info
-        width = x2 - x1
-        height = y2 - y1
-        self._zoom_label.value = (
-            f"<h4>Zoom View</h4>"
-            f"Zoomed Region: ({x1},{y1}) to ({x2},{y2}) - {width}x{height} px"
-        )
-
         # Extract full-resolution region from each channel
         zoom_channels = {}
         for name, channel in self.channels.items():
@@ -442,12 +432,8 @@ class PseudochannelExplorer:
         with self._zoom_output:
             self._zoom_output.clear_output(wait=True)
 
-            # Determine figure size based on aspect ratio
-            aspect = width / height if height > 0 else 1
-            fig_height = 6
-            fig_width = min(12, fig_height * aspect)
-
-            fig, ax = plt.subplots(figsize=(fig_width, fig_height))
+            # Use fixed 6x6 figure size to match preview (side by side layout)
+            fig, ax = plt.subplots(figsize=(6, 6))
 
             # Check if nuclear overlay is enabled
             if (
@@ -467,10 +453,8 @@ class PseudochannelExplorer:
                     nuclear_norm   # B
                 ], axis=-1)
                 ax.imshow(rgb)
-                ax.set_title(f"Full Resolution + Nuclear ({width}x{height} px)")
             else:
                 ax.imshow(zoomed_pseudochannel, cmap=self.cmap_dropdown.value)
-                ax.set_title(f"Full Resolution Zoom ({width}x{height} px)")
 
             ax.axis("off")
             plt.tight_layout()
@@ -479,9 +463,6 @@ class PseudochannelExplorer:
     def _on_reset_zoom(self, button):
         """Clear zoom region and reset view."""
         self._zoom_region = None
-        self._zoom_label.value = (
-            "<h4>Zoom View</h4><i>Draw a rectangle on the preview to zoom</i>"
-        )
         with self._zoom_output:
             self._zoom_output.clear_output()
 
@@ -516,10 +497,8 @@ class PseudochannelExplorer:
                     nuclear_norm   # B
                 ], axis=-1)
                 self._ax.imshow(rgb)
-                self._ax.set_title("Pseudochannel + Nuclear (draw rectangle to zoom)")
             else:
                 self._ax.imshow(pseudochannel, cmap=self.cmap_dropdown.value)
-                self._ax.set_title("Pseudochannel Preview (draw rectangle to zoom)")
 
             self._ax.axis("off")
 
