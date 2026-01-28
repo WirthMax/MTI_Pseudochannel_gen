@@ -7,12 +7,13 @@ from typing import Optional, Union
 import ipywidgets as widgets
 import matplotlib.pyplot as plt
 import numpy as np
+import tifffile
 from IPython.display import display
 from matplotlib.widgets import RectangleSelector
 
 from .core import compute_pseudochannel
 from .io import load_channel_folder, load_ome_tiff, OMETiffChannels, validate_channels
-from .preview import create_preview_stack
+from .preview import create_preview_stack, downsample_image
 
 
 def create_weight_sliders(
@@ -77,6 +78,7 @@ class PseudochannelExplorer:
         preview_size: int = 512,
         debounce_ms: int = 100,
         exclude_channels: set[str] | list[str] | None = None,
+        nuclear_marker_path: Optional[Union[str, Path]] = None,
     ):
         """Initialize the explorer.
 
@@ -93,6 +95,9 @@ class PseudochannelExplorer:
             exclude_channels: Channel names to exclude (case-insensitive).
                 If None, uses DEFAULT_EXCLUDED_CHANNELS.
                 Pass empty set/list to include all channels.
+            nuclear_marker_path: Path to nuclear marker TIFF file (e.g., DAPI).
+                If provided, enables nuclear overlay toggle. For OME-TIFF input,
+                the DAPI channel will be auto-detected if not specified.
         """
         self.preview_size = preview_size
         self.debounce_ms = debounce_ms
@@ -108,6 +113,16 @@ class PseudochannelExplorer:
         self._fig = None  # Figure reference
         self._ax = None  # Axes reference
 
+        # Nuclear marker overlay state
+        self.nuclear_marker = None  # Full-res nuclear marker array
+        self.nuclear_preview = None  # Downsampled nuclear marker
+        self._show_nuclear = False  # Toggle state
+
+        # Store original channels input and marker info for OME-TIFF auto-detection
+        self._original_channels_input = channels
+        self._marker_file = marker_file
+        self._marker_column = marker_column
+
         self.channels = self._load_channels(
             channels, marker_file, marker_column, exclude_channels
         )
@@ -115,6 +130,9 @@ class PseudochannelExplorer:
 
         self.previews = create_preview_stack(self.channels, preview_size)
         self.channel_names = list(self.channels.keys())
+
+        # Load nuclear marker
+        self._load_nuclear_marker(nuclear_marker_path)
 
         self._setup_widgets()
 
@@ -144,6 +162,65 @@ class PseudochannelExplorer:
             )
 
         raise ValueError(f"Invalid channels input: {channels}")
+
+    def _load_nuclear_marker(
+        self, nuclear_marker_path: Optional[Union[str, Path]]
+    ) -> None:
+        """Load nuclear marker for overlay.
+
+        Args:
+            nuclear_marker_path: Path to nuclear marker TIFF file.
+                If None, attempts to auto-detect DAPI from OME-TIFF.
+        """
+        # Option A: Load from explicit path
+        if nuclear_marker_path is not None:
+            path = Path(nuclear_marker_path)
+            if path.is_file():
+                self.nuclear_marker = tifffile.imread(str(path))
+                self.nuclear_preview = downsample_image(
+                    self.nuclear_marker, self.preview_size
+                )
+                return
+
+        # Option B: Auto-detect DAPI from OME-TIFF
+        if isinstance(self.channels, OMETiffChannels):
+            self._load_nuclear_from_ome_tiff()
+
+    def _load_nuclear_from_ome_tiff(self) -> None:
+        """Try to load DAPI channel from OME-TIFF source."""
+        if not isinstance(self.channels, OMETiffChannels):
+            return
+
+        # Look for DAPI in the original (unfiltered) marker names
+        dapi_names = {"dapi", "hoechst", "nuclear", "nuclei"}
+        for i, name in enumerate(self.channels._all_marker_names):
+            if name.lower() in dapi_names or "dapi" in name.lower():
+                # Extract from the underlying data
+                if self.channels._data.ndim == 3:
+                    self.nuclear_marker = np.array(self.channels._data[i])
+                else:
+                    self.nuclear_marker = np.array(
+                        self.channels._data[i, self.channels._z_slice]
+                    )
+                self.nuclear_preview = downsample_image(
+                    self.nuclear_marker, self.preview_size
+                )
+                return
+
+    def _normalize_nuclear(self, arr: np.ndarray) -> np.ndarray:
+        """Normalize nuclear marker to 0-1 range using percentile stretch.
+
+        Args:
+            arr: Nuclear marker array
+
+        Returns:
+            Normalized array in 0-1 range
+        """
+        arr = arr.astype(np.float32)
+        vmin, vmax = np.percentile(arr, [1, 99])
+        if vmax > vmin:
+            return np.clip((arr - vmin) / (vmax - vmin), 0, 1)
+        return np.zeros_like(arr)
 
     def _setup_widgets(self):
         """Create all widget components."""
@@ -180,13 +257,14 @@ class PseudochannelExplorer:
         # Organize sliders into columns based on count
         slider_box = self._create_slider_columns(list(self.sliders.values()))
 
-        # Setup zoom widgets
-        self._setup_zoom_widgets()
+        # Setup zoom widgets and nuclear toggle
+        self._setup_extra_widgets()
 
         controls = widgets.HBox([
             self.reset_button,
             self.normalize_dropdown,
             self.cmap_dropdown,
+            self.nuclear_toggle,
             self.reset_zoom_button,
         ])
 
@@ -252,8 +330,8 @@ class PseudochannelExplorer:
 
         return widgets.HBox(columns, layout=widgets.Layout(padding="10px"))
 
-    def _setup_zoom_widgets(self):
-        """Create zoom output widget, reset button, and info label."""
+    def _setup_extra_widgets(self):
+        """Create zoom output widget, reset button, nuclear toggle, and info label."""
         self._zoom_output = widgets.Output()
         self._zoom_label = widgets.HTML(
             value="<h4>Zoom View</h4><i>Draw a rectangle on the preview to zoom</i>"
@@ -265,6 +343,19 @@ class PseudochannelExplorer:
             icon="search-minus",
         )
         self.reset_zoom_button.on_click(self._on_reset_zoom)
+
+        # Nuclear marker overlay toggle
+        has_nuclear = self.nuclear_marker is not None
+        self.nuclear_toggle = widgets.Checkbox(
+            value=False,
+            description="Show Nuclear (DAPI)",
+            indent=False,
+            disabled=not has_nuclear,
+            layout=widgets.Layout(width="180px"),
+        )
+        if not has_nuclear:
+            self.nuclear_toggle.description = "Nuclear N/A"
+        self.nuclear_toggle.observe(self._on_slider_change, names="value")
 
     def _on_rectangle_select(self, eclick, erelease):
         """Handle rectangle selection callback from RectangleSelector."""
@@ -357,8 +448,30 @@ class PseudochannelExplorer:
             fig_width = min(12, fig_height * aspect)
 
             fig, ax = plt.subplots(figsize=(fig_width, fig_height))
-            ax.imshow(zoomed_pseudochannel, cmap=self.cmap_dropdown.value)
-            ax.set_title(f"Full Resolution Zoom ({width}x{height} px)")
+
+            # Check if nuclear overlay is enabled
+            if (
+                self.nuclear_toggle.value
+                and self.nuclear_marker is not None
+            ):
+                # Extract nuclear region at full resolution
+                nuclear_region = self.nuclear_marker[y1:y2, x1:x2]
+
+                # Create RGB composite
+                pseudo_norm = zoomed_pseudochannel
+                nuclear_norm = self._normalize_nuclear(nuclear_region)
+
+                rgb = np.stack([
+                    pseudo_norm,   # R
+                    pseudo_norm,   # G
+                    nuclear_norm   # B
+                ], axis=-1)
+                ax.imshow(rgb)
+                ax.set_title(f"Full Resolution + Nuclear ({width}x{height} px)")
+            else:
+                ax.imshow(zoomed_pseudochannel, cmap=self.cmap_dropdown.value)
+                ax.set_title(f"Full Resolution Zoom ({width}x{height} px)")
+
             ax.axis("off")
             plt.tight_layout()
             plt.show()
@@ -387,8 +500,27 @@ class PseudochannelExplorer:
             self.output.clear_output(wait=True)
 
             self._fig, self._ax = plt.subplots(figsize=(6, 6))
-            self._ax.imshow(pseudochannel, cmap=self.cmap_dropdown.value)
-            self._ax.set_title("Pseudochannel Preview (draw rectangle to zoom)")
+
+            # Check if nuclear overlay is enabled
+            if (
+                self.nuclear_toggle.value
+                and self.nuclear_preview is not None
+            ):
+                # Create RGB composite: pseudo in red+green (yellow), nuclear in blue
+                pseudo_norm = pseudochannel  # Already 0-1 from compute_pseudochannel
+                nuclear_norm = self._normalize_nuclear(self.nuclear_preview)
+
+                rgb = np.stack([
+                    pseudo_norm,   # R
+                    pseudo_norm,   # G
+                    nuclear_norm   # B
+                ], axis=-1)
+                self._ax.imshow(rgb)
+                self._ax.set_title("Pseudochannel + Nuclear (draw rectangle to zoom)")
+            else:
+                self._ax.imshow(pseudochannel, cmap=self.cmap_dropdown.value)
+                self._ax.set_title("Pseudochannel Preview (draw rectangle to zoom)")
+
             self._ax.axis("off")
 
             # Add RectangleSelector for zoom functionality
@@ -433,6 +565,7 @@ def create_interactive_explorer(
     marker_column: Optional[Union[int, str]] = None,
     preview_size: int = 512,
     exclude_channels: set[str] | list[str] | None = None,
+    nuclear_marker_path: Optional[Union[str, Path]] = None,
 ) -> PseudochannelExplorer:
     """Main function to create and display the interactive explorer.
 
@@ -448,6 +581,9 @@ def create_interactive_explorer(
         exclude_channels: Channel names to exclude (case-insensitive).
             If None, uses DEFAULT_EXCLUDED_CHANNELS.
             Pass empty set/list to include all channels.
+        nuclear_marker_path: Path to nuclear marker TIFF file (e.g., DAPI).
+            If provided, enables nuclear overlay toggle. For OME-TIFF input,
+            the DAPI channel will be auto-detected if not specified.
 
     Returns:
         PseudochannelExplorer instance
@@ -474,6 +610,12 @@ def create_interactive_explorer(
             "./data/channels/",
             exclude_channels=[]
         )
+
+        # With nuclear marker overlay (folder input)
+        explorer = create_interactive_explorer(
+            "./data/channels/",
+            nuclear_marker_path="./data/DAPI.tif"
+        )
     """
     explorer = PseudochannelExplorer(
         channels,
@@ -481,6 +623,7 @@ def create_interactive_explorer(
         marker_column=marker_column,
         preview_size=preview_size,
         exclude_channels=exclude_channels,
+        nuclear_marker_path=nuclear_marker_path,
     )
     explorer.display()
     return explorer
