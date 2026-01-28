@@ -8,6 +8,7 @@ import ipywidgets as widgets
 import matplotlib.pyplot as plt
 import numpy as np
 from IPython.display import display
+from matplotlib.widgets import RectangleSelector
 
 from .core import compute_pseudochannel
 from .io import load_channel_folder, load_ome_tiff, OMETiffChannels, validate_channels
@@ -100,6 +101,13 @@ class PseudochannelExplorer:
         self._last_update_time = 0
         self._pending_update = False
 
+        # Zoom feature state
+        self._zoom_region = None  # (x1, y1, x2, y2) in preview coords
+        self._zoom_output = None  # Output widget for zoomed view
+        self._rect_selector = None  # RectangleSelector instance
+        self._fig = None  # Figure reference
+        self._ax = None  # Axes reference
+
         self.channels = self._load_channels(
             channels, marker_file, marker_column, exclude_channels
         )
@@ -169,15 +177,17 @@ class PseudochannelExplorer:
         for slider in self.sliders.values():
             slider.observe(self._on_slider_change, names="value")
 
-        slider_box = widgets.VBox(
-            list(self.sliders.values()),
-            layout=widgets.Layout(padding="10px"),
-        )
+        # Organize sliders into columns based on count
+        slider_box = self._create_slider_columns(list(self.sliders.values()))
+
+        # Setup zoom widgets
+        self._setup_zoom_widgets()
 
         controls = widgets.HBox([
             self.reset_button,
             self.normalize_dropdown,
             self.cmap_dropdown,
+            self.reset_zoom_button,
         ])
 
         self.main_widget = widgets.VBox([
@@ -187,6 +197,8 @@ class PseudochannelExplorer:
                 self.output,
             ]),
             controls,
+            self._zoom_label,
+            self._zoom_output,
         ])
 
     def _on_slider_change(self, change):
@@ -203,6 +215,163 @@ class PseudochannelExplorer:
             slider.value = 0.0
         self._update_preview()
 
+    def _create_slider_columns(self, sliders: list) -> widgets.HBox:
+        """Distribute sliders across multiple columns based on count.
+
+        Args:
+            sliders: List of slider widgets
+
+        Returns:
+            HBox containing VBox columns of sliders
+        """
+        n_sliders = len(sliders)
+
+        # Determine number of columns based on slider count
+        if n_sliders >= 30:
+            n_cols = 3
+        elif n_sliders >= 15:
+            n_cols = 2
+        else:
+            n_cols = 1
+
+        # Adjust slider width for multi-column layout
+        slider_width = "250px" if n_cols > 1 else "400px"
+        for slider in sliders:
+            slider.layout.width = slider_width
+
+        # Distribute sliders evenly across columns
+        sliders_per_col = (n_sliders + n_cols - 1) // n_cols
+        columns = []
+        for i in range(n_cols):
+            start = i * sliders_per_col
+            end = min(start + sliders_per_col, n_sliders)
+            col_sliders = sliders[start:end]
+            columns.append(
+                widgets.VBox(col_sliders, layout=widgets.Layout(padding="5px"))
+            )
+
+        return widgets.HBox(columns, layout=widgets.Layout(padding="10px"))
+
+    def _setup_zoom_widgets(self):
+        """Create zoom output widget, reset button, and info label."""
+        self._zoom_output = widgets.Output()
+        self._zoom_label = widgets.HTML(
+            value="<h4>Zoom View</h4><i>Draw a rectangle on the preview to zoom</i>"
+        )
+
+        self.reset_zoom_button = widgets.Button(
+            description="Reset Zoom",
+            button_style="info",
+            icon="search-minus",
+        )
+        self.reset_zoom_button.on_click(self._on_reset_zoom)
+
+    def _on_rectangle_select(self, eclick, erelease):
+        """Handle rectangle selection callback from RectangleSelector."""
+        x1, y1 = eclick.xdata, eclick.ydata
+        x2, y2 = erelease.xdata, erelease.ydata
+
+        # Ensure coordinates are in correct order
+        x1, x2 = min(x1, x2), max(x1, x2)
+        y1, y2 = min(y1, y2), max(y1, y2)
+
+        self._zoom_region = (x1, y1, x2, y2)
+        self._update_zoom_view()
+
+    def _preview_to_full_coords(self, preview_coords: tuple) -> tuple:
+        """Map preview coordinates to full-resolution coordinates.
+
+        Args:
+            preview_coords: (x1, y1, x2, y2) in preview coordinate space
+
+        Returns:
+            (x1, y1, x2, y2) in full-resolution coordinate space
+        """
+        x1, y1, x2, y2 = preview_coords
+
+        # Get original image dimensions from first channel
+        first_channel = next(iter(self.channels.values()))
+        orig_height, orig_width = first_channel.shape[:2]
+
+        # Get preview dimensions
+        preview_shape = next(iter(self.previews.values())).shape
+        preview_height, preview_width = preview_shape[:2]
+
+        # Calculate scale factors
+        scale_x = orig_width / preview_width
+        scale_y = orig_height / preview_height
+
+        # Map coordinates
+        full_x1 = int(x1 * scale_x)
+        full_y1 = int(y1 * scale_y)
+        full_x2 = int(x2 * scale_x)
+        full_y2 = int(y2 * scale_y)
+
+        # Clamp to image bounds
+        full_x1 = max(0, min(full_x1, orig_width))
+        full_x2 = max(0, min(full_x2, orig_width))
+        full_y1 = max(0, min(full_y1, orig_height))
+        full_y2 = max(0, min(full_y2, orig_height))
+
+        return (full_x1, full_y1, full_x2, full_y2)
+
+    def _update_zoom_view(self):
+        """Compute and display zoomed region at full resolution."""
+        if self._zoom_region is None:
+            return
+
+        # Get full-resolution coordinates
+        full_coords = self._preview_to_full_coords(self._zoom_region)
+        x1, y1, x2, y2 = full_coords
+
+        # Update label with region info
+        width = x2 - x1
+        height = y2 - y1
+        self._zoom_label.value = (
+            f"<h4>Zoom View</h4>"
+            f"Zoomed Region: ({x1},{y1}) to ({x2},{y2}) - {width}x{height} px"
+        )
+
+        # Extract full-resolution region from each channel
+        zoom_channels = {}
+        for name, channel in self.channels.items():
+            zoom_channels[name] = channel[y1:y2, x1:x2]
+
+        # Compute pseudochannel for zoomed region
+        weights = get_weights_from_sliders(self.sliders)
+        normalize = self.normalize_dropdown.value
+
+        zoomed_pseudochannel = compute_pseudochannel(
+            zoom_channels,
+            weights,
+            normalize=normalize,
+        )
+
+        # Display zoomed region
+        with self._zoom_output:
+            self._zoom_output.clear_output(wait=True)
+
+            # Determine figure size based on aspect ratio
+            aspect = width / height if height > 0 else 1
+            fig_height = 6
+            fig_width = min(12, fig_height * aspect)
+
+            fig, ax = plt.subplots(figsize=(fig_width, fig_height))
+            ax.imshow(zoomed_pseudochannel, cmap=self.cmap_dropdown.value)
+            ax.set_title(f"Full Resolution Zoom ({width}x{height} px)")
+            ax.axis("off")
+            plt.tight_layout()
+            plt.show()
+
+    def _on_reset_zoom(self, button):
+        """Clear zoom region and reset view."""
+        self._zoom_region = None
+        self._zoom_label.value = (
+            "<h4>Zoom View</h4><i>Draw a rectangle on the preview to zoom</i>"
+        )
+        with self._zoom_output:
+            self._zoom_output.clear_output()
+
     def _update_preview(self):
         """Update the preview image based on current slider values."""
         weights = get_weights_from_sliders(self.sliders)
@@ -217,12 +386,29 @@ class PseudochannelExplorer:
         with self.output:
             self.output.clear_output(wait=True)
 
-            fig, ax = plt.subplots(figsize=(6, 6))
-            ax.imshow(pseudochannel, cmap=self.cmap_dropdown.value)
-            ax.set_title("Pseudochannel Preview")
-            ax.axis("off")
+            self._fig, self._ax = plt.subplots(figsize=(6, 6))
+            self._ax.imshow(pseudochannel, cmap=self.cmap_dropdown.value)
+            self._ax.set_title("Pseudochannel Preview (draw rectangle to zoom)")
+            self._ax.axis("off")
+
+            # Add RectangleSelector for zoom functionality
+            self._rect_selector = RectangleSelector(
+                self._ax,
+                self._on_rectangle_select,
+                useblit=True,
+                button=[1],  # Left click only
+                minspanx=5,
+                minspany=5,
+                interactive=True,
+                props=dict(facecolor="cyan", alpha=0.3),
+            )
+
             plt.tight_layout()
             plt.show()
+
+        # Update zoom view if region is selected
+        if self._zoom_region is not None:
+            self._update_zoom_view()
 
     def display(self):
         """Display the interactive widget."""
