@@ -372,7 +372,11 @@ def load_ome_tiff(
     marker_names = load_marker_names(marker_file, column=marker_column)
 
     if use_memmap:
-        data = tifffile.memmap(str(tiff_path), mode="r")
+        try:
+            data = tifffile.memmap(str(tiff_path), mode="r")
+        except ValueError:
+            # Compressed TIFFs can't be memory-mapped, fall back to imread
+            data = tifffile.imread(str(tiff_path))
     else:
         data = tifffile.imread(str(tiff_path))
 
@@ -445,7 +449,11 @@ class OMETiffChannels:
         self.tiff_path = Path(tiff_path)
         all_marker_names = load_marker_names(marker_file, column=marker_column)
 
-        self._data = tifffile.memmap(str(self.tiff_path), mode="r")
+        try:
+            self._data = tifffile.memmap(str(self.tiff_path), mode="r")
+        except ValueError:
+            # Compressed TIFFs can't be memory-mapped, fall back to imread
+            self._data = tifffile.imread(str(self.tiff_path))
 
         if self._data.ndim == 3:
             self._channel_axis = 0
