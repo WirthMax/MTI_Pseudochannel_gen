@@ -277,6 +277,68 @@ def load_marker_names(
     return names
 
 
+def load_mcmicro_markers(
+    marker_file: Union[str, Path],
+    keep_removed: bool = False,
+) -> list[str]:
+    """Load marker names from MCMICRO markers.csv format.
+
+    MCMICRO marker files have columns like:
+        channel_number,cycle_number,marker_name,Filter,background,exposure,remove
+
+    This function extracts marker_name and optionally filters out rows
+    where remove=TRUE.
+
+    Args:
+        marker_file: Path to MCMICRO markers.csv file
+        keep_removed: If False (default), skip rows where remove=TRUE.
+            Set to True to include all markers.
+
+    Returns:
+        List of marker names in channel order
+
+    Raises:
+        FileNotFoundError: If marker file doesn't exist
+        ValueError: If file format is invalid
+    """
+    marker_file = Path(marker_file)
+
+    if not marker_file.exists():
+        raise FileNotFoundError(f"Marker file not found: {marker_file}")
+
+    with open(marker_file, newline="") as f:
+        reader = csv.DictReader(f)
+        rows = list(reader)
+
+    if not rows:
+        raise ValueError(f"Empty marker file: {marker_file}")
+
+    # Check for required column
+    if "marker_name" not in rows[0]:
+        raise ValueError(
+            f"Column 'marker_name' not found in {marker_file}. "
+            "Expected MCMICRO format with columns: "
+            "channel_number,cycle_number,marker_name,Filter,background,exposure,remove"
+        )
+
+    names = []
+    for row in rows:
+        # Check remove column if it exists
+        if not keep_removed and "remove" in row:
+            remove_val = row["remove"].strip().upper()
+            if remove_val in ("TRUE", "1", "YES"):
+                continue
+
+        name = row["marker_name"].strip()
+        if name:
+            names.append(name)
+
+    if not names:
+        raise ValueError(f"No marker names found in {marker_file} after filtering")
+
+    return names
+
+
 def load_ome_tiff(
     tiff_path: Union[str, Path],
     marker_file: Union[str, Path],

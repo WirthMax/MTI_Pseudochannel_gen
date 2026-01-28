@@ -49,6 +49,14 @@ OME_TIFF_PATH = "/path/to/image.ome.tiff"
 MARKER_FILE = "/path/to/markers.txt"
 ```
 
+For MCMICRO output, use `load_mcmicro_markers()` which reads the `markers.csv` format and skips channels marked for removal:
+```python
+from pseudochannel import load_mcmicro_markers
+
+marker_names = load_mcmicro_markers("/path/to/markers.csv")
+# Reads marker_name column, skips rows where remove=TRUE
+```
+
 ### 2. Tune weights interactively
 
 The notebook launches a widget with sliders for each channel. Drag them around and watch the preview update. The preview is downsampled so it's fast even with large images.
