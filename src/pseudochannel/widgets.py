@@ -8,7 +8,7 @@ import ipywidgets as widgets
 import matplotlib.pyplot as plt
 import numpy as np
 import tifffile
-from IPython.display import display
+from IPython.display import display, Javascript
 from matplotlib.widgets import RectangleSelector
 
 from .core import compute_pseudochannel
@@ -242,7 +242,7 @@ class PseudochannelExplorer:
         return np.zeros_like(arr)
 
     def _setup_widgets(self):
-        """Create all widget components."""
+        """Create all widget components with responsive layout."""
         self.sliders = create_weight_sliders(self.channel_names)
 
         self.output = widgets.Output()
@@ -273,31 +273,83 @@ class PseudochannelExplorer:
         for slider in self.sliders.values():
             slider.observe(self._on_slider_change, names="value")
 
-        # Organize sliders into columns based on count
-        slider_box = self._create_slider_columns(list(self.sliders.values()))
-
         # Setup zoom widgets and nuclear toggle
         self._setup_extra_widgets()
 
-        controls = widgets.HBox([
-            self.reset_button,
-            self.normalize_dropdown,
-            self.cmap_dropdown,
-            self.nuclear_toggle,
-            self.reset_zoom_button,
-        ])
-
-        # Main row: sliders | preview | zoom (aligned at top)
-        main_row = widgets.HBox(
-            [slider_box, self.output, self._zoom_output],
-            layout=widgets.Layout(align_items="flex-start"),
+        # Controls bar with flex wrap for narrow screens
+        controls = widgets.Box(
+            [
+                self.reset_button,
+                self.normalize_dropdown,
+                self.cmap_dropdown,
+                self.nuclear_toggle,
+                self.reset_zoom_button,
+                widgets.HTML("<span style='color:#888; margin: 0 5px;'>|</span>"),
+                self.columns_dropdown,
+                self.layout_dropdown,
+            ],
+            layout=widgets.Layout(
+                display="flex",
+                flex_flow="row wrap",
+                gap="10px",
+                align_items="center",
+                margin="0 0 10px 0",
+            ),
         )
 
-        self.main_widget = widgets.VBox([
-            widgets.HTML("<h3>Pseudochannel Weight Tuning</h3>"),
-            controls,
-            main_row,
-        ])
+        # Create slider container (will be reorganized dynamically)
+        self._slider_container = widgets.Box(
+            layout=widgets.Layout(
+                display="flex",
+                flex_flow="row wrap",
+                gap="5px",
+                min_width="200px",
+                flex="1 1 auto",
+            )
+        )
+        self._update_slider_layout()
+
+        # Preview/zoom container
+        self._preview_container = widgets.Box(
+            [self.output, self._zoom_output],
+            layout=widgets.Layout(
+                display="flex",
+                flex_flow="row wrap",
+                gap="10px",
+                justify_content="flex-start",
+                align_items="flex-start",
+                flex="0 0 auto",
+            ),
+        )
+
+        # Main content area with responsive flex layout
+        # Sliders and preview will wrap to stack vertically when narrow
+        self._main_content = widgets.Box(
+            [self._slider_container, self._preview_container],
+            layout=widgets.Layout(
+                display="flex",
+                flex_flow="row wrap",
+                gap="20px",
+                align_items="flex-start",
+                width="100%",
+            ),
+        )
+
+        # Width tracker for responsive updates
+        self._width_tracker = widgets.HTML(
+            value="",
+            layout=widgets.Layout(display="none"),
+        )
+
+        self.main_widget = widgets.VBox(
+            [
+                widgets.HTML("<h3>Pseudochannel Weight Tuning</h3>"),
+                controls,
+                self._main_content,
+                self._width_tracker,
+            ],
+            layout=widgets.Layout(width="100%"),
+        )
 
     def _on_slider_change(self, change):
         """Handle slider value changes with debouncing."""
@@ -313,26 +365,29 @@ class PseudochannelExplorer:
             slider.value = 0.0
         self._update_preview()
 
-    def _create_slider_columns(self, sliders: list) -> widgets.HBox:
-        """Distribute sliders across multiple columns based on count.
+    def _update_slider_layout(self, n_cols: int = None):
+        """Update slider layout with specified number of columns.
 
         Args:
-            sliders: List of slider widgets
-
-        Returns:
-            HBox containing VBox columns of sliders
+            n_cols: Number of columns. If None, auto-detect based on slider count.
         """
+        sliders = list(self.sliders.values())
         n_sliders = len(sliders)
 
-        # Determine number of columns based on slider count
-        if n_sliders >= 20:
-            n_cols = 3
-        elif n_sliders >= 10:
-            n_cols = 2
-        else:
-            n_cols = 1
+        # Auto-detect columns if not specified
+        if n_cols is None:
+            if n_sliders >= 30:
+                n_cols = 4
+            elif n_sliders >= 20:
+                n_cols = 3
+            elif n_sliders >= 10:
+                n_cols = 2
+            else:
+                n_cols = 1
 
-        # Adjust slider width for multi-column layout
+        self._current_slider_cols = n_cols
+
+        # Use fixed slider width - ipywidgets doesn't handle percentage widths well
         slider_width = "280px"
         for slider in sliders:
             slider.layout.width = slider_width
@@ -344,14 +399,49 @@ class PseudochannelExplorer:
             start = i * sliders_per_col
             end = min(start + sliders_per_col, n_sliders)
             col_sliders = sliders[start:end]
-            columns.append(
-                widgets.VBox(col_sliders, layout=widgets.Layout(padding="5px"))
-            )
+            if col_sliders:
+                col = widgets.VBox(
+                    col_sliders,
+                    layout=widgets.Layout(padding="5px"),
+                )
+                columns.append(col)
 
-        return widgets.HBox(columns, layout=widgets.Layout(padding="10px"))
+        # Update the slider container
+        self._slider_container.children = columns
+
+    def set_layout_columns(self, n_cols: int):
+        """Manually set the number of slider columns.
+
+        Args:
+            n_cols: Number of columns (1-6)
+        """
+        n_cols = max(1, min(6, n_cols))
+        self._update_slider_layout(n_cols)
+
+    def set_layout_mode(self, mode: str):
+        """Set the layout mode.
+
+        Args:
+            mode: One of:
+                - "horizontal": Sliders beside preview (default for wide screens)
+                - "vertical": Sliders above preview (better for narrow screens)
+                - "auto": Automatically choose based on content
+        """
+        if mode == "vertical":
+            self._main_content.layout.flex_flow = "column"
+            self._slider_container.layout.width = "100%"
+            self._preview_container.layout.width = "100%"
+        elif mode == "horizontal":
+            self._main_content.layout.flex_flow = "row wrap"
+            self._slider_container.layout.width = "auto"
+            self._preview_container.layout.width = "auto"
+        else:  # auto
+            self._main_content.layout.flex_flow = "row wrap"
+            self._slider_container.layout.width = "auto"
+            self._preview_container.layout.width = "auto"
 
     def _setup_extra_widgets(self):
-        """Create zoom output widget, reset button, and nuclear toggle."""
+        """Create zoom output widget, reset button, nuclear toggle, and layout controls."""
         self._zoom_output = widgets.Output()
 
         self.reset_zoom_button = widgets.Button(
@@ -373,6 +463,41 @@ class PseudochannelExplorer:
         if not has_nuclear:
             self.nuclear_toggle.description = "Nuclear N/A"
         self.nuclear_toggle.observe(self._on_slider_change, names="value")
+
+        # Layout control widgets
+        n_sliders = len(self.channel_names)
+        max_cols = min(6, max(1, n_sliders // 5))
+        default_cols = 3 if n_sliders >= 20 else (2 if n_sliders >= 10 else 1)
+
+        self.columns_dropdown = widgets.Dropdown(
+            options=[(str(i), i) for i in range(1, max_cols + 1)],
+            value=default_cols,
+            description="Columns:",
+            style={"description_width": "60px"},
+            layout=widgets.Layout(width="120px"),
+        )
+        self.columns_dropdown.observe(self._on_columns_change, names="value")
+
+        self.layout_dropdown = widgets.Dropdown(
+            options=[
+                ("Auto", "auto"),
+                ("Side by side", "horizontal"),
+                ("Stacked", "vertical"),
+            ],
+            value="auto",
+            description="Layout:",
+            style={"description_width": "50px"},
+            layout=widgets.Layout(width="140px"),
+        )
+        self.layout_dropdown.observe(self._on_layout_change, names="value")
+
+    def _on_columns_change(self, change):
+        """Handle column count change."""
+        self._update_slider_layout(change["new"])
+
+    def _on_layout_change(self, change):
+        """Handle layout mode change."""
+        self.set_layout_mode(change["new"])
 
     def _on_rectangle_select(self, eclick, erelease):
         """Handle rectangle selection callback from RectangleSelector."""
@@ -427,6 +552,7 @@ class PseudochannelExplorer:
         """Create the zoom figure once (lazily on first zoom)."""
         with self._zoom_output:
             self._zoom_fig, self._zoom_ax = plt.subplots(figsize=(6, 6))
+            self._zoom_fig.canvas.header_visible = False
             self._zoom_ax.axis("off")
             plt.tight_layout()
             plt.show()
@@ -524,6 +650,7 @@ class PseudochannelExplorer:
         """Create the preview figure once."""
         with self.output:
             self._preview_fig, self._preview_ax = plt.subplots(figsize=(6, 6))
+            self._preview_fig.canvas.header_visible = False
             self._preview_ax.axis("off")
 
             # Create initial blank image
