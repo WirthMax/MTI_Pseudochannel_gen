@@ -348,6 +348,9 @@ def load_ome_tiff(
 ) -> dict[str, np.ndarray]:
     """Load a multi-channel OME-TIFF with marker names from a separate file.
 
+    Note: This function loads ALL channels into memory at once. For large files,
+    consider using OMETiffChannels instead, which loads channels on-demand.
+
     Args:
         tiff_path: Path to OME-TIFF file containing all channels
         marker_file: Path to file with marker names (one per channel)
@@ -424,9 +427,13 @@ def load_ome_tiff(
 class OMETiffChannels:
     """Wrapper for OME-TIFF that provides dict-like access to channels.
 
-    This class keeps the underlying memory-mapped array open and provides
-    views into individual channels, which is more memory-efficient than
-    creating separate arrays for each channel.
+    This class uses lazy loading - it opens the file instantly (reading only
+    metadata) and loads individual channel data on-demand when accessed.
+    This is much more efficient for large files, especially compressed ones.
+
+    Use as a context manager to ensure proper cleanup:
+        with OMETiffChannels(path, markers) as channels:
+            img = channels["CD45"]
     """
 
     def __init__(
@@ -449,21 +456,33 @@ class OMETiffChannels:
         self.tiff_path = Path(tiff_path)
         all_marker_names = load_marker_names(marker_file, column=marker_column)
 
-        try:
-            self._data = tifffile.memmap(str(self.tiff_path), mode="r")
-        except ValueError:
-            # Compressed TIFFs can't be memory-mapped, fall back to imread
-            self._data = tifffile.imread(str(self.tiff_path))
+        # Open file lazily - only reads metadata, not pixel data
+        self._tiff = tifffile.TiffFile(str(self.tiff_path))
 
-        if self._data.ndim == 3:
-            self._channel_axis = 0
-        elif self._data.ndim == 4:
-            self._channel_axis = 0
+        # Get the first series (standard for OME-TIFF)
+        if not self._tiff.series:
+            raise ValueError(f"No image series found in {tiff_path}")
+        self._series = self._tiff.series[0]
+
+        # Get shape from series metadata
+        series_shape = self._series.shape
+        ndim = len(series_shape)
+
+        if ndim == 2:
+            # Single 2D image
+            n_channels = 1
+            self._z_slice = None
+        elif ndim == 3:
+            # (C, Y, X)
+            n_channels = series_shape[0]
+            self._z_slice = None
+        elif ndim == 4:
+            # (C, Z, Y, X) - take first Z slice
+            n_channels = series_shape[0]
             self._z_slice = 0
         else:
-            raise ValueError(f"Unexpected dimensions: {self._data.ndim}")
+            raise ValueError(f"Unexpected dimensions: {ndim}")
 
-        n_channels = self._data.shape[self._channel_axis]
         if len(all_marker_names) != n_channels:
             raise ValueError(
                 f"Mismatch: {n_channels} channels but "
@@ -488,17 +507,43 @@ class OMETiffChannels:
             if name in self.marker_names
         }
 
+        # Cache for loaded channels (optional, can reduce repeated reads)
+        self._cache: dict[str, np.ndarray] = {}
+
     def __getitem__(self, name: str) -> np.ndarray:
-        """Get channel by name."""
+        """Get channel by name (loads on demand)."""
         if name not in self._name_to_idx:
             raise KeyError(f"Unknown channel: {name}")
 
+        # Return cached if available
+        if name in self._cache:
+            return self._cache[name]
+
         idx = self._name_to_idx[name]
 
-        if self._data.ndim == 3:
-            return self._data[idx]
+        # Read only this channel from the file using page-level access
+        # This avoids loading the entire multi-channel array
+        series_shape = self._series.shape
+        ndim = len(series_shape)
+
+        if ndim == 2:
+            # Single 2D image - just one page
+            data = self._series.pages[0].asarray()
+        elif ndim == 3:
+            # (C, Y, X) - each channel is a separate page
+            data = self._series.pages[idx].asarray()
+        elif ndim == 4:
+            # (C, Z, Y, X) - pages are arranged as C*Z
+            # Page index = channel_idx * n_z_slices + z_slice
+            n_z = series_shape[1]
+            page_idx = idx * n_z + self._z_slice
+            data = self._series.pages[page_idx].asarray()
         else:
-            return self._data[idx, self._z_slice]
+            # Fallback: read specific page by index
+            data = self._series.pages[idx].asarray()
+
+        self._cache[name] = data
+        return data
 
     def __contains__(self, name: str) -> bool:
         """Check if channel exists."""
@@ -529,12 +574,36 @@ class OMETiffChannels:
     @property
     def shape(self) -> tuple[int, int]:
         """Shape of individual channel images (H, W)."""
-        if self._data.ndim == 3:
-            return self._data.shape[1:]
+        series_shape = self._series.shape
+        ndim = len(series_shape)
+        if ndim == 2:
+            return series_shape
+        elif ndim == 3:
+            return series_shape[1:]
         else:
-            return self._data.shape[2:]
+            return series_shape[2:]
 
     @property
     def dtype(self):
         """Data type of the array."""
-        return self._data.dtype
+        return self._series.dtype
+
+    def close(self):
+        """Close the underlying file."""
+        if hasattr(self, "_tiff") and self._tiff is not None:
+            self._tiff.close()
+            self._tiff = None
+        self._cache.clear()
+
+    def __enter__(self):
+        """Context manager entry."""
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        """Context manager exit."""
+        self.close()
+        return False
+
+    def __del__(self):
+        """Cleanup on deletion."""
+        self.close()
