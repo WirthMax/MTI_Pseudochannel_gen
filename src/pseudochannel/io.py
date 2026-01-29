@@ -345,6 +345,7 @@ def load_ome_tiff(
     marker_column: Optional[Union[int, str]] = None,
     use_memmap: bool = True,
     exclude_channels: set[str] | list[str] | None = None,
+    mcmicro_markers: bool = False,
 ) -> dict[str, np.ndarray]:
     """Load a multi-channel OME-TIFF with marker names from a separate file.
 
@@ -359,6 +360,9 @@ def load_ome_tiff(
         exclude_channels: Channel names to exclude (case-insensitive).
             If None, uses DEFAULT_EXCLUDED_CHANNELS.
             Pass empty set/list to include all channels.
+        mcmicro_markers: If True, parse marker_file as MCMICRO format
+            (with marker_name column and remove column for filtering).
+            This filters out channels marked remove=TRUE.
 
     Returns:
         Dict mapping channel_name -> 2D array (view into the OME-TIFF)
@@ -372,7 +376,10 @@ def load_ome_tiff(
     if not tiff_path.exists():
         raise FileNotFoundError(f"TIFF file not found: {tiff_path}")
 
-    marker_names = load_marker_names(marker_file, column=marker_column)
+    if mcmicro_markers:
+        marker_names = load_mcmicro_markers(marker_file)
+    else:
+        marker_names = load_marker_names(marker_file, column=marker_column)
 
     if use_memmap:
         try:
@@ -442,6 +449,7 @@ class OMETiffChannels:
         marker_file: Union[str, Path],
         marker_column: Optional[Union[int, str]] = None,
         exclude_channels: set[str] | list[str] | None = None,
+        mcmicro_markers: bool = False,
     ):
         """Initialize OME-TIFF channel accessor.
 
@@ -452,9 +460,14 @@ class OMETiffChannels:
             exclude_channels: Channel names to exclude (case-insensitive).
                 If None, uses DEFAULT_EXCLUDED_CHANNELS.
                 Pass empty set/list to include all channels.
+            mcmicro_markers: If True, parse marker_file as MCMICRO format
+                (with marker_name column and remove column for filtering).
         """
         self.tiff_path = Path(tiff_path)
-        all_marker_names = load_marker_names(marker_file, column=marker_column)
+        if mcmicro_markers:
+            all_marker_names = load_mcmicro_markers(marker_file)
+        else:
+            all_marker_names = load_marker_names(marker_file, column=marker_column)
 
         # Open file lazily - only reads metadata, not pixel data
         self._tiff = tifffile.TiffFile(str(self.tiff_path))

@@ -80,6 +80,7 @@ class PseudochannelExplorer:
         exclude_channels: set[str] | list[str] | None = None,
         nuclear_marker_path: Optional[Union[str, Path]] = None,
         max_zoom_size: int = 1024,
+        mcmicro_markers: bool = False,
     ):
         """Initialize the explorer.
 
@@ -101,6 +102,8 @@ class PseudochannelExplorer:
                 the DAPI channel will be auto-detected if not specified.
             max_zoom_size: Maximum size for zoom region. Larger regions will be
                 downsampled for faster display.
+            mcmicro_markers: If True, parse marker_file as MCMICRO format
+                (with marker_name column and remove column for filtering).
         """
         self.preview_size = preview_size
         self.debounce_ms = debounce_ms
@@ -134,9 +137,10 @@ class PseudochannelExplorer:
         self._original_channels_input = channels
         self._marker_file = marker_file
         self._marker_column = marker_column
+        self._mcmicro_markers = mcmicro_markers
 
         self.channels = self._load_channels(
-            channels, marker_file, marker_column, exclude_channels
+            channels, marker_file, marker_column, exclude_channels, mcmicro_markers
         )
         validate_channels(self.channels)
 
@@ -154,6 +158,7 @@ class PseudochannelExplorer:
         marker_file: Optional[Union[str, Path]],
         marker_column: Optional[Union[int, str]],
         exclude_channels: set[str] | list[str] | None,
+        mcmicro_markers: bool = False,
     ) -> Union[dict, OMETiffChannels]:
         """Load channels from various input types."""
         if isinstance(channels, (dict, OMETiffChannels)):
@@ -170,7 +175,9 @@ class PseudochannelExplorer:
                     "marker_file is required when loading from OME-TIFF"
                 )
             return load_ome_tiff(
-                path, marker_file, marker_column, exclude_channels=exclude_channels
+                path, marker_file, marker_column,
+                exclude_channels=exclude_channels,
+                mcmicro_markers=mcmicro_markers,
             )
 
         raise ValueError(f"Invalid channels input: {channels}")
@@ -643,6 +650,7 @@ def create_interactive_explorer(
     exclude_channels: set[str] | list[str] | None = None,
     nuclear_marker_path: Optional[Union[str, Path]] = None,
     max_zoom_size: int = 1024,
+    mcmicro_markers: bool = False,
 ) -> PseudochannelExplorer:
     """Main function to create and display the interactive explorer.
 
@@ -663,6 +671,8 @@ def create_interactive_explorer(
             the DAPI channel will be auto-detected if not specified.
         max_zoom_size: Maximum size for zoom region display. Larger regions
             will be downsampled for faster rendering.
+        mcmicro_markers: If True, parse marker_file as MCMICRO format
+            (with marker_name column and remove column for filtering).
 
     Returns:
         PseudochannelExplorer instance
@@ -704,6 +714,7 @@ def create_interactive_explorer(
         exclude_channels=exclude_channels,
         nuclear_marker_path=nuclear_marker_path,
         max_zoom_size=max_zoom_size,
+        mcmicro_markers=mcmicro_markers,
     )
     explorer.display()
     return explorer

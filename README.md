@@ -49,12 +49,28 @@ OME_TIFF_PATH = "/path/to/image.ome.tiff"
 MARKER_FILE = "/path/to/markers.txt"
 ```
 
-For MCMICRO output, use `load_mcmicro_markers()` which reads the `markers.csv` format and skips channels marked for removal:
-```python
-from pseudochannel import load_mcmicro_markers
+**MCMICRO format** - If your marker file is in MCMICRO format (with `marker_name` and `remove` columns), use the `mcmicro_markers=True` flag. This automatically filters out channels marked `remove=TRUE`:
 
-marker_names = load_mcmicro_markers("/path/to/markers.csv")
-# Reads marker_name column, skips rows where remove=TRUE
+```python
+from pseudochannel import load_ome_tiff, OMETiffChannels, create_interactive_explorer
+
+# With load_ome_tiff
+channels = load_ome_tiff(
+    "/path/to/image.ome.tiff",
+    "/path/to/markers.csv",
+    mcmicro_markers=True,  # Filters out remove=TRUE rows
+)
+```
+
+**Large or compressed OME-TIFF files** - Use `OMETiffChannels` instead of `load_ome_tiff()`. It opens instantly (only reads metadata) and loads individual channels on-demand, which is much faster and uses less memory:
+
+```python
+# This loads ALL channels into memory at once (slow for large files)
+channels = load_ome_tiff(path, markers)
+
+# This opens instantly and loads channels only when accessed (fast)
+with OMETiffChannels(path, markers) as channels:
+    cd45 = channels["CD45"]  # Only loads this channel
 ```
 
 ### 2. Tune weights interactively
