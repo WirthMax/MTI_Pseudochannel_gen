@@ -584,6 +584,35 @@ class OMETiffChannels:
         for name in self.marker_names:
             yield name, self[name]
 
+    def get_channel_by_index(self, idx: int) -> np.ndarray:
+        """Get channel by original index (bypasses exclusion filtering).
+
+        This is useful for loading channels like DAPI that may be excluded
+        from the main marker list but still needed for visualization.
+
+        Args:
+            idx: Original channel index in the TIFF file
+
+        Returns:
+            Channel data as numpy array
+        """
+        if idx < 0 or idx >= len(self._all_marker_names):
+            raise IndexError(f"Channel index {idx} out of range (0-{len(self._all_marker_names)-1})")
+
+        series_shape = self._series.shape
+        ndim = len(series_shape)
+
+        if ndim == 2:
+            return self._series.pages[0].asarray()
+        elif ndim == 3:
+            return self._series.pages[idx].asarray()
+        elif ndim == 4:
+            n_z = series_shape[1]
+            page_idx = idx * n_z + self._z_slice
+            return self._series.pages[page_idx].asarray()
+        else:
+            return self._series.pages[idx].asarray()
+
     @property
     def shape(self) -> tuple[int, int]:
         """Shape of individual channel images (H, W)."""

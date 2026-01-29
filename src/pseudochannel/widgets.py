@@ -214,13 +214,8 @@ class PseudochannelExplorer:
         dapi_names = {"dapi", "hoechst", "nuclear", "nuclei"}
         for i, name in enumerate(self.channels._all_marker_names):
             if name.lower() in dapi_names or "dapi" in name.lower():
-                # Extract from the underlying data
-                if self.channels._data.ndim == 3:
-                    self.nuclear_marker = np.array(self.channels._data[i])
-                else:
-                    self.nuclear_marker = np.array(
-                        self.channels._data[i, self.channels._z_slice]
-                    )
+                # Load channel by original index (bypasses exclusion filtering)
+                self.nuclear_marker = self.channels.get_channel_by_index(i)
                 self.nuclear_preview = downsample_image(
                     self.nuclear_marker, self.preview_size
                 )
