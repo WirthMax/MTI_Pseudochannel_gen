@@ -174,8 +174,11 @@ class PseudochannelExplorer:
                 raise ValueError(
                     "marker_file is required when loading from OME-TIFF"
                 )
-            return load_ome_tiff(
-                path, marker_file, marker_column,
+            # Use OMETiffChannels for lazy loading and nuclear marker auto-detection
+            return OMETiffChannels(
+                path,
+                marker_file,
+                marker_column=marker_column,
                 exclude_channels=exclude_channels,
                 mcmicro_markers=mcmicro_markers,
             )
