@@ -10,6 +10,15 @@ from typing import Optional
 import numpy as np
 
 
+def _gpu_available() -> bool:
+    """Check if a CUDA GPU is available via PyTorch."""
+    try:
+        import torch
+        return torch.cuda.is_available()
+    except ImportError:
+        return False
+
+
 @dataclass
 class CellposeConfig:
     """Configuration for Cellpose segmentation."""
@@ -18,8 +27,12 @@ class CellposeConfig:
     diameter: Optional[float] = None  # None = auto-estimate
     flow_threshold: float = 0.4
     cellprob_threshold: float = 0.0
-    gpu: bool = False
+    gpu: Optional[bool] = None  # None = auto-detect
     min_size: int = 15
+
+    def __post_init__(self):
+        if self.gpu is None:
+            self.gpu = _gpu_available()
 
     def to_dict(self) -> dict:
         """Serialize to dict for YAML round-tripping."""
