@@ -13,6 +13,7 @@ def save_config(
     name: Optional[str] = None,
     description: Optional[str] = None,
     normalization: str = "minmax",
+    extra_sections: Optional[dict] = None,
 ) -> Path:
     """Save weight configuration to YAML file.
 
@@ -22,6 +23,8 @@ def save_config(
         name: Optional name for the configuration
         description: Optional description
         normalization: Normalization method used
+        extra_sections: Optional dict of extra top-level sections to merge
+            into the config (e.g. ``{"cellpose": {...}}``).
 
     Returns:
         Path to saved config file
@@ -38,6 +41,9 @@ def save_config(
         "normalization": normalization,
         "created": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
     }
+
+    if extra_sections:
+        config.update(extra_sections)
 
     with open(output_path, "w") as f:
         yaml.dump(config, f, default_flow_style=False, sort_keys=False)
@@ -155,3 +161,29 @@ def validate_config_channels(
     missing = config_channels - available
 
     return len(missing) == 0, list(missing)
+
+
+def load_cellpose_config(config: dict) -> Optional[dict]:
+    """Extract the cellpose section from a loaded config.
+
+    Args:
+        config: Config dict from load_config().
+
+    Returns:
+        Cellpose parameter dict, or None if not present.
+    """
+    return config.get("cellpose")
+
+
+def save_cellpose_config(config: dict, cellpose_params: dict) -> dict:
+    """Merge a cellpose section into a config dict (in-memory).
+
+    Args:
+        config: Existing config dict.
+        cellpose_params: Cellpose parameter dict to merge.
+
+    Returns:
+        Updated config dict (same object, mutated).
+    """
+    config["cellpose"] = cellpose_params
+    return config

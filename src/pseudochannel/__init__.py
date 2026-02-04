@@ -20,6 +20,7 @@ from .io import (
 from .core import compute_pseudochannel
 from .preview import create_preview_stack, downsample_image
 from .config import save_config, load_config
+from .segmentation import CellposeConfig, run_segmentation, extract_mask_contours
 from .batch import process_dataset
 
 __version__ = "0.1.0"
@@ -38,5 +39,8 @@ __all__ = [
     "downsample_image",
     "save_config",
     "load_config",
+    "CellposeConfig",
+    "run_segmentation",
+    "extract_mask_contours",
     "process_dataset",
 ]

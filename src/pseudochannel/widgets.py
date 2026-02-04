@@ -14,6 +14,14 @@ from matplotlib.widgets import RectangleSelector
 from .core import compute_pseudochannel
 from .io import load_channel_folder, load_ome_tiff, OMETiffChannels, validate_channels
 from .preview import create_preview_stack, downsample_image
+from .segmentation import (
+    CellposeConfig,
+    _check_cellpose,
+    create_cellpose_model,
+    run_segmentation,
+    extract_mask_contours,
+    overlay_contours_on_axes,
+)
 
 
 def create_weight_sliders(
@@ -132,6 +140,15 @@ class PseudochannelExplorer:
         # Nuclear marker overlay state
         self.nuclear_marker = None  # Full-res nuclear marker array
         self.nuclear_preview = None  # Downsampled nuclear marker
+
+        # Segmentation state
+        self._cellpose_model = None
+        self._cellpose_config = CellposeConfig()
+        self._segmentation_masks = None  # Cached (H,W) int mask
+        self._mask_contour_lines = []  # matplotlib Line2D artists
+        self._mask_contours_data = []  # Cached contour coordinate lists
+        self._seg_zoom_region = None  # Zoom region when masks were computed
+        self._seg_weights_hash = None  # Hash of weights when masks were computed
 
         # Store original channels input and marker info for OME-TIFF auto-detection
         self._original_channels_input = channels
@@ -285,6 +302,10 @@ class PseudochannelExplorer:
                 widgets.HTML("<span style='color:#888; margin: 0 5px;'>|</span>"),
                 self.columns_dropdown,
                 self.layout_dropdown,
+                widgets.HTML("<span style='color:#888; margin: 0 5px;'>|</span>"),
+                self.segment_button,
+                self.show_masks_toggle,
+                self.seg_status_label,
             ],
             layout=widgets.Layout(
                 display="flex",
@@ -489,6 +510,29 @@ class PseudochannelExplorer:
         )
         self.layout_dropdown.observe(self._on_layout_change, names="value")
 
+        # Segmentation widgets
+        self.segment_button = widgets.Button(
+            description="Segment",
+            button_style="success",
+            icon="crosshairs",
+            disabled=True,
+        )
+        self.segment_button.on_click(self._on_segment_click)
+
+        self.show_masks_toggle = widgets.Checkbox(
+            value=False,
+            description="Show Masks",
+            indent=False,
+            disabled=True,
+            layout=widgets.Layout(width="140px"),
+        )
+        self.show_masks_toggle.observe(self._on_toggle_masks, names="value")
+
+        self.seg_status_label = widgets.HTML(
+            value="",
+            layout=widgets.Layout(width="200px"),
+        )
+
     def _on_columns_change(self, change):
         """Handle column count change."""
         self._update_slider_layout(change["new"])
@@ -507,6 +551,7 @@ class PseudochannelExplorer:
         y1, y2 = min(y1, y2), max(y1, y2)
 
         self._zoom_region = (x1, y1, x2, y2)
+        self.segment_button.disabled = False
         self._update_zoom_view()
 
     def _preview_to_full_coords(self, preview_coords: tuple) -> tuple:
@@ -555,6 +600,76 @@ class PseudochannelExplorer:
             plt.tight_layout()
             plt.show()
 
+    def _get_zoom_segmentation_inputs(self):
+        """Compute pseudochannel and nuclear arrays for the current zoom region.
+
+        Returns:
+            Tuple of (pseudochannel, nuclear_or_None, step) where
+            pseudochannel is (H, W) float32 in [0, 1],
+            nuclear is (H, W) float32 in [0, 1] or None,
+            and step is the downsample stride used.
+        """
+        full_coords = self._preview_to_full_coords(self._zoom_region)
+        x1, y1, x2, y2 = full_coords
+
+        region_height = y2 - y1
+        region_width = x2 - x1
+        max_dim = max(region_height, region_width)
+
+        if max_dim > self.max_zoom_size:
+            scale = self.max_zoom_size / max_dim
+            step = max(1, int(1 / scale))
+        else:
+            step = 1
+
+        weights = get_weights_from_sliders(self.sliders)
+        active_weights = {k: v for k, v in weights.items() if v > 0}
+
+        zoom_channels = {}
+        for name in active_weights:
+            if name in self.channels:
+                region = self.channels[name][y1:y2:step, x1:x2:step]
+                zoom_channels[name] = region.astype(np.float32)
+
+        normalize = self.normalize_dropdown.value
+
+        if zoom_channels:
+            pseudochannel = compute_pseudochannel(
+                zoom_channels,
+                active_weights,
+                normalize=normalize,
+            )
+        else:
+            pseudochannel = np.zeros(
+                ((y2 - y1) // step or 1, (x2 - x1) // step or 1),
+                dtype=np.float32,
+            )
+
+        nuclear = None
+        if self.nuclear_marker is not None:
+            nuclear = self._normalize_nuclear(
+                self.nuclear_marker[y1:y2:step, x1:x2:step]
+            )
+
+        return pseudochannel, nuclear, step
+
+    def _compute_weights_hash(self) -> int:
+        """Hash of active weights + normalization for cache invalidation."""
+        weights = get_weights_from_sliders(self.sliders)
+        active = tuple(sorted((k, v) for k, v in weights.items() if v > 0))
+        return hash((active, self.normalize_dropdown.value))
+
+    def _invalidate_segmentation(self):
+        """Clear all cached segmentation data."""
+        self._segmentation_masks = None
+        self._mask_contours_data = []
+        self._clear_mask_contours()
+        self._seg_zoom_region = None
+        self._seg_weights_hash = None
+        self.show_masks_toggle.value = False
+        self.show_masks_toggle.disabled = True
+        self.seg_status_label.value = ""
+
     def _update_zoom_view(self):
         """Compute and display zoomed region with optimizations."""
         if self._zoom_region is None:
@@ -564,62 +679,30 @@ class PseudochannelExplorer:
         if self._zoom_fig is None:
             self._create_zoom_figure()
 
-        # Get full-resolution coordinates
-        full_coords = self._preview_to_full_coords(self._zoom_region)
-        x1, y1, x2, y2 = full_coords
+        pseudochannel, nuclear, step = self._get_zoom_segmentation_inputs()
 
-        # Calculate region size and downsample factor if needed
-        region_height = y2 - y1
-        region_width = x2 - x1
-        max_dim = max(region_height, region_width)
-
-        if max_dim > self.max_zoom_size:
-            # Downsample for speed
-            scale = self.max_zoom_size / max_dim
-            step = max(1, int(1 / scale))
-        else:
-            step = 1
-
-        # Get current weights - only process channels with non-zero weights
-        weights = get_weights_from_sliders(self.sliders)
-        active_weights = {k: v for k, v in weights.items() if v > 0}
-
-        # Extract regions only for active channels (with stride for large regions)
-        zoom_channels = {}
-        for name in active_weights:
-            if name in self.channels:
-                region = self.channels[name][y1:y2:step, x1:x2:step]
-                zoom_channels[name] = region.astype(np.float32)
-
-        # Compute pseudochannel for zoomed region
-        normalize = self.normalize_dropdown.value
-
-        if zoom_channels:
-            zoomed_pseudochannel = compute_pseudochannel(
-                zoom_channels,
-                active_weights,
-                normalize=normalize,
-            )
-        else:
-            # No active channels - show zeros
-            zoomed_pseudochannel = np.zeros(
-                ((y2 - y1) // step or 1, (x2 - x1) // step or 1),
-                dtype=np.float32
-            )
+        # Check if cached segmentation is still valid
+        current_hash = self._compute_weights_hash()
+        cache_valid = (
+            self._segmentation_masks is not None
+            and self._seg_zoom_region == self._zoom_region
+            and self._seg_weights_hash == current_hash
+        )
+        if not cache_valid and self._segmentation_masks is not None:
+            self._invalidate_segmentation()
 
         # Determine if we need RGB or grayscale
         use_rgb = (
             self.nuclear_toggle.value
-            and self.nuclear_marker is not None
+            and self.nuclear_preview is not None
         )
 
         if use_rgb:
-            nuclear_region = self.nuclear_marker[y1:y2:step, x1:x2:step]
-            pseudo_norm = zoomed_pseudochannel
-            nuclear_norm = self._normalize_nuclear(nuclear_region)
+            pseudo_norm = pseudochannel
+            nuclear_norm = nuclear
             data = np.stack([pseudo_norm, pseudo_norm, nuclear_norm], axis=-1)
         else:
-            data = zoomed_pseudochannel
+            data = pseudochannel
 
         # Always recreate image when data shape changes (new rectangle)
         # This ensures clean updates
@@ -633,11 +716,19 @@ class PseudochannelExplorer:
             )
         self._zoom_is_rgb = use_rgb
 
+        # Re-overlay cached contours if still valid (ax.clear() removed them)
+        if cache_valid and self.show_masks_toggle.value:
+            self._mask_contour_lines = overlay_contours_on_axes(
+                self._zoom_ax, self._mask_contours_data
+            )
+
         self._zoom_fig.canvas.draw_idle()
 
     def _on_reset_zoom(self, button):
         """Clear zoom region and reset view."""
         self._zoom_region = None
+        self.segment_button.disabled = True
+        self._invalidate_segmentation()
         if self._zoom_fig is not None:
             self._zoom_ax.clear()
             self._zoom_ax.axis("off")
@@ -736,6 +827,94 @@ class PseudochannelExplorer:
         if self._zoom_region is not None:
             self._update_zoom_view()
 
+    # -- Segmentation methods --------------------------------------------------
+
+    def _on_segment_click(self, button):
+        """Handle Segment button click."""
+        if self._zoom_region is None:
+            self.seg_status_label.value = (
+                "<span style='color:orange'>Select a zoom region first</span>"
+            )
+            return
+
+        if not _check_cellpose():
+            self.seg_status_label.value = (
+                "<span style='color:red'>Cellpose not installed. "
+                "Run: pip install cellpose</span>"
+            )
+            return
+
+        self.segment_button.disabled = True
+        self.seg_status_label.value = (
+            "<span style='color:#888'>Segmenting...</span>"
+        )
+
+        try:
+            # Lazy-init model
+            if self._cellpose_model is None:
+                self._cellpose_model = create_cellpose_model(self._cellpose_config)
+
+            pseudochannel, nuclear, step = self._get_zoom_segmentation_inputs()
+
+            masks = run_segmentation(
+                self._cellpose_model, pseudochannel, nuclear, self._cellpose_config
+            )
+            contours = extract_mask_contours(masks)
+
+            # Cache results
+            self._segmentation_masks = masks
+            self._mask_contours_data = contours
+            self._seg_zoom_region = self._zoom_region
+            self._seg_weights_hash = self._compute_weights_hash()
+
+            # Enable and activate mask toggle
+            self.show_masks_toggle.disabled = False
+            self.show_masks_toggle.value = True
+
+            self._draw_mask_contours()
+
+            n_cells = masks.max()
+            self.seg_status_label.value = (
+                f"<span style='color:green'>{n_cells} cell{'s' if n_cells != 1 else ''} found</span>"
+            )
+        except Exception as e:
+            self.seg_status_label.value = (
+                f"<span style='color:red'>Error: {e}</span>"
+            )
+        finally:
+            self.segment_button.disabled = False
+
+    def _draw_mask_contours(self):
+        """Draw cached contours on the zoom axes."""
+        self._clear_mask_contours()
+        if (
+            self.show_masks_toggle.value
+            and self._mask_contours_data
+            and self._zoom_ax is not None
+        ):
+            self._mask_contour_lines = overlay_contours_on_axes(
+                self._zoom_ax, self._mask_contours_data
+            )
+            self._zoom_fig.canvas.draw_idle()
+
+    def _clear_mask_contours(self):
+        """Remove all contour Line2D artists from the zoom axes."""
+        for line in self._mask_contour_lines:
+            try:
+                line.remove()
+            except ValueError:
+                pass
+        self._mask_contour_lines = []
+
+    def _on_toggle_masks(self, change):
+        """Show or hide mask contours."""
+        if change["new"]:
+            self._draw_mask_contours()
+        else:
+            self._clear_mask_contours()
+            if self._zoom_fig is not None:
+                self._zoom_fig.canvas.draw_idle()
+
     def display(self):
         """Display the interactive widget."""
         display(self.main_widget)
@@ -765,6 +944,11 @@ class PseudochannelExplorer:
             self._zoom_fig = None
             self._zoom_ax = None
             self._zoom_img = None
+        # Clean up segmentation resources
+        self._cellpose_model = None
+        self._segmentation_masks = None
+        self._mask_contour_lines = []
+        self._mask_contours_data = []
 
 
 def create_interactive_explorer(
