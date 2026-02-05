@@ -12,6 +12,14 @@ Say you're segmenting immune cells in tumor tissue. You've got CD45, CD3, CD8, C
 
 The solution: blend multiple channels together with different weights until you get a composite that captures all cell boundaries. That's what this does.
 
+## Features
+
+- **Interactive weight tuning** with real-time preview
+- **Cellpose segmentation preview** - test your pseudochannel directly in the zoom view
+- **Auto DAPI detection** for both OME-TIFF and MACSima folder formats
+- **GPU acceleration** - auto-detects CUDA when available
+- **Batch processing** - apply weights to entire datasets
+
 ## Quick Start
 
 ```bash
@@ -35,7 +43,15 @@ CHANNEL_FOLDER = "/path/to/your/roi/"
 
 By default, marker names are extracted using the MACSima naming convention (`_A-<marker>` at the end):
 ```
-C-001_S-000_S_APC_R-01_W-A-1_ROI-08_A-CD45.tif  →  "CD45"
+C-001_S-000_S_APC_R-01_W-A-1_ROI-08_A-CD45_C-2B11.tif  →  "CD45"
+```
+
+**MACSima mode** - For MACSima data, use `macsima_mode=True` to enable automatic DAPI detection. This finds all DAPI images and keeps only the one with the lowest cycle number (C-number) as the nuclear marker:
+```python
+explorer = create_interactive_explorer(
+    "/path/to/roi/",
+    macsima_mode=True  # Auto-detects DAPI, uses MACSima naming pattern
+)
 ```
 
 For other instruments, pass a custom regex with one capture group:
@@ -81,6 +97,30 @@ You can also overlay DAPI in blue to see how your membrane pseudochannel aligns 
 
 Draw a rectangle on the preview to zoom in at full resolution and check the details.
 
+### 2b. Preview segmentation (optional)
+
+Once you have a zoom region selected, you can preview Cellpose segmentation directly in the widget:
+
+1. Click **Segment** to run Cellpose on the zoomed region
+2. Mask contours appear overlaid on the image in green
+3. Toggle **Show Masks** to hide/show the contours
+4. Adjust parameters with the sliders:
+   - **Diameter**: Cell size in pixels (0 = auto-estimate)
+   - **Flow thr**: Flow error threshold (lower = stricter)
+   - **Prob thr**: Cell probability threshold (higher = fewer cells)
+
+Cellpose uses your current pseudochannel weights and the nuclear marker (if available) for two-channel segmentation.
+
+**Note**: Cellpose is an optional dependency. Install it with:
+```bash
+pip install cellpose
+
+# For GPU support (much faster):
+pip install cellpose torch --extra-index-url https://download.pytorch.org/whl/cu118
+```
+
+GPU is auto-detected when available.
+
 ### 3. Save your config
 
 Once you're happy with the weights, save them to a YAML file:
@@ -117,6 +157,7 @@ DAPI, autofluorescence channels, empty channels, and a few other common non-mark
 │   ├── core.py             # Pseudochannel computation
 │   ├── io.py               # TIFF/OME-TIFF loading
 │   ├── widgets.py          # Interactive Jupyter widget
+│   ├── segmentation.py     # Cellpose wrapper (optional)
 │   ├── batch.py            # Batch processing
 │   └── config.py           # Config save/load
 ├── notebooks/
@@ -137,5 +178,9 @@ DAPI, autofluorescence channels, empty channels, and a few other common non-mark
 - Python 3.10+
 - numpy, tifffile, matplotlib, ipywidgets, ipympl
 - JupyterLab (for the interactive widget)
+
+**Optional** (for segmentation preview):
+- cellpose (+ torch for GPU support)
+- scikit-image (for contour extraction, falls back to numpy if missing)
 
 See `environment.yaml` for the full list.

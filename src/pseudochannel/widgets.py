@@ -12,7 +12,7 @@ from IPython.display import display, Javascript
 from matplotlib.widgets import RectangleSelector
 
 from .core import compute_pseudochannel
-from .io import load_channel_folder, load_ome_tiff, OMETiffChannels, validate_channels
+from .io import load_channel_folder, load_ome_tiff, OMETiffChannels, FolderChannels, validate_channels
 from .preview import create_preview_stack, downsample_image
 from .segmentation import (
     CellposeConfig,
@@ -89,6 +89,7 @@ class PseudochannelExplorer:
         nuclear_marker_path: Optional[Union[str, Path]] = None,
         max_zoom_size: int = 1024,
         mcmicro_markers: bool = False,
+        macsima_mode: bool = False,
     ):
         """Initialize the explorer.
 
@@ -106,12 +107,16 @@ class PseudochannelExplorer:
                 If None, uses DEFAULT_EXCLUDED_CHANNELS.
                 Pass empty set/list to include all channels.
             nuclear_marker_path: Path to nuclear marker TIFF file (e.g., DAPI).
-                If provided, enables nuclear overlay toggle. For OME-TIFF input,
-                the DAPI channel will be auto-detected if not specified.
+                If provided, enables nuclear overlay toggle. For OME-TIFF and
+                MACSima folder input, the DAPI channel will be auto-detected
+                if not specified.
             max_zoom_size: Maximum size for zoom region. Larger regions will be
                 downsampled for faster display.
             mcmicro_markers: If True, parse marker_file as MCMICRO format
                 (with marker_name column and remove column for filtering).
+            macsima_mode: If True, enables MACSima-specific handling for folder
+                input: uses MACSima naming pattern and auto-detects DAPI
+                (keeping only the one with lowest C-number as nuclear marker).
         """
         self.preview_size = preview_size
         self.debounce_ms = debounce_ms
@@ -155,9 +160,11 @@ class PseudochannelExplorer:
         self._marker_file = marker_file
         self._marker_column = marker_column
         self._mcmicro_markers = mcmicro_markers
+        self._macsima_mode = macsima_mode
 
         self.channels = self._load_channels(
-            channels, marker_file, marker_column, exclude_channels, mcmicro_markers
+            channels, marker_file, marker_column, exclude_channels,
+            mcmicro_markers, macsima_mode,
         )
         validate_channels(self.channels)
 
@@ -171,20 +178,25 @@ class PseudochannelExplorer:
 
     def _load_channels(
         self,
-        channels: Union[str, Path, dict, OMETiffChannels],
+        channels: Union[str, Path, dict, OMETiffChannels, FolderChannels],
         marker_file: Optional[Union[str, Path]],
         marker_column: Optional[Union[int, str]],
         exclude_channels: set[str] | list[str] | None,
         mcmicro_markers: bool = False,
-    ) -> Union[dict, OMETiffChannels]:
+        macsima_mode: bool = False,
+    ) -> Union[dict, OMETiffChannels, FolderChannels]:
         """Load channels from various input types."""
-        if isinstance(channels, (dict, OMETiffChannels)):
+        if isinstance(channels, (dict, OMETiffChannels, FolderChannels)):
             return channels
 
         path = Path(channels)
 
         if path.is_dir():
-            return load_channel_folder(path, exclude_channels=exclude_channels)
+            return load_channel_folder(
+                path,
+                exclude_channels=exclude_channels,
+                macsima_mode=macsima_mode,
+            )
 
         if path.is_file():
             if marker_file is None:
@@ -209,7 +221,8 @@ class PseudochannelExplorer:
 
         Args:
             nuclear_marker_path: Path to nuclear marker TIFF file.
-                If None, attempts to auto-detect DAPI from OME-TIFF.
+                If None, attempts to auto-detect DAPI from OME-TIFF or
+                MACSima folder.
         """
         # Option A: Load from explicit path
         if nuclear_marker_path is not None:
@@ -221,7 +234,15 @@ class PseudochannelExplorer:
                 )
                 return
 
-        # Option B: Auto-detect DAPI from OME-TIFF
+        # Option B: Auto-detect DAPI from FolderChannels (MACSima mode)
+        if isinstance(self.channels, FolderChannels) and self.channels.nuclear_path:
+            self.nuclear_marker = tifffile.imread(str(self.channels.nuclear_path))
+            self.nuclear_preview = downsample_image(
+                self.nuclear_marker, self.preview_size
+            )
+            return
+
+        # Option C: Auto-detect DAPI from OME-TIFF
         if isinstance(self.channels, OMETiffChannels):
             self._load_nuclear_from_ome_tiff()
 
@@ -306,6 +327,9 @@ class PseudochannelExplorer:
                 self.segment_button,
                 self.show_masks_toggle,
                 self.seg_status_label,
+                self.diameter_slider,
+                self.flow_threshold_slider,
+                self.cellprob_threshold_slider,
             ],
             layout=widgets.Layout(
                 display="flex",
@@ -532,6 +556,52 @@ class PseudochannelExplorer:
             value="",
             layout=widgets.Layout(width="200px"),
         )
+
+        # Cellpose parameter controls
+        self.diameter_slider = widgets.FloatSlider(
+            value=0.0,
+            min=0.0,
+            max=200.0,
+            step=1.0,
+            description="Diameter:",
+            description_tooltip="Cell diameter in pixels (0 = auto-estimate)",
+            continuous_update=False,
+            readout=True,
+            readout_format=".0f",
+            style={"description_width": "70px"},
+            layout=widgets.Layout(width="240px"),
+        )
+        self.diameter_slider.observe(self._on_seg_param_change, names="value")
+
+        self.flow_threshold_slider = widgets.FloatSlider(
+            value=0.4,
+            min=0.0,
+            max=1.0,
+            step=0.05,
+            description="Flow thr:",
+            description_tooltip="Flow error threshold (lower = stricter)",
+            continuous_update=False,
+            readout=True,
+            readout_format=".2f",
+            style={"description_width": "70px"},
+            layout=widgets.Layout(width="240px"),
+        )
+        self.flow_threshold_slider.observe(self._on_seg_param_change, names="value")
+
+        self.cellprob_threshold_slider = widgets.FloatSlider(
+            value=0.0,
+            min=-6.0,
+            max=6.0,
+            step=0.5,
+            description="Prob thr:",
+            description_tooltip="Cell probability threshold (higher = fewer cells)",
+            continuous_update=False,
+            readout=True,
+            readout_format=".1f",
+            style={"description_width": "70px"},
+            layout=widgets.Layout(width="240px"),
+        )
+        self.cellprob_threshold_slider.observe(self._on_seg_param_change, names="value")
 
     def _on_columns_change(self, change):
         """Handle column count change."""
@@ -829,6 +899,17 @@ class PseudochannelExplorer:
 
     # -- Segmentation methods --------------------------------------------------
 
+    def _sync_cellpose_config(self):
+        """Update CellposeConfig from the current widget values."""
+        diameter = self.diameter_slider.value
+        self._cellpose_config.diameter = None if diameter == 0 else diameter
+        self._cellpose_config.flow_threshold = self.flow_threshold_slider.value
+        self._cellpose_config.cellprob_threshold = self.cellprob_threshold_slider.value
+
+    def _on_seg_param_change(self, change):
+        """Handle segmentation parameter slider changes."""
+        self._invalidate_segmentation()
+
     def _on_segment_click(self, button):
         """Handle Segment button click."""
         if self._zoom_region is None:
@@ -850,6 +931,8 @@ class PseudochannelExplorer:
         )
 
         try:
+            self._sync_cellpose_config()
+
             # Lazy-init model
             if self._cellpose_model is None:
                 self._cellpose_model = create_cellpose_model(self._cellpose_config)
@@ -960,6 +1043,7 @@ def create_interactive_explorer(
     nuclear_marker_path: Optional[Union[str, Path]] = None,
     max_zoom_size: int = 1024,
     mcmicro_markers: bool = False,
+    macsima_mode: bool = False,
 ) -> PseudochannelExplorer:
     """Main function to create and display the interactive explorer.
 
@@ -976,12 +1060,17 @@ def create_interactive_explorer(
             If None, uses DEFAULT_EXCLUDED_CHANNELS.
             Pass empty set/list to include all channels.
         nuclear_marker_path: Path to nuclear marker TIFF file (e.g., DAPI).
-            If provided, enables nuclear overlay toggle. For OME-TIFF input,
-            the DAPI channel will be auto-detected if not specified.
+            If provided, enables nuclear overlay toggle. For OME-TIFF and
+            MACSima folder input, the DAPI channel will be auto-detected
+            if not specified.
         max_zoom_size: Maximum size for zoom region display. Larger regions
             will be downsampled for faster rendering.
         mcmicro_markers: If True, parse marker_file as MCMICRO format
             (with marker_name column and remove column for filtering).
+        macsima_mode: If True, enables MACSima-specific handling for folder
+            input: uses MACSima naming pattern for marker extraction and
+            auto-detects DAPI (keeping only the one with lowest C-number
+            as nuclear marker).
 
     Returns:
         PseudochannelExplorer instance
@@ -989,6 +1078,12 @@ def create_interactive_explorer(
     Examples:
         # From channel folder
         explorer = create_interactive_explorer("./data/channels/")
+
+        # From MACSima folder with auto DAPI detection
+        explorer = create_interactive_explorer(
+            "./data/roi/",
+            macsima_mode=True
+        )
 
         # From OME-TIFF with marker file
         explorer = create_interactive_explorer(
@@ -1024,6 +1119,7 @@ def create_interactive_explorer(
         nuclear_marker_path=nuclear_marker_path,
         max_zoom_size=max_zoom_size,
         mcmicro_markers=mcmicro_markers,
+        macsima_mode=macsima_mode,
     )
     explorer.display()
     return explorer

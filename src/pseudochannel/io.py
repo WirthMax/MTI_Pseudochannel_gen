@@ -50,12 +50,28 @@ def _should_exclude_channel(
 
 # Default regex pattern for MACSima filenames:
 # C-000_S-000_AFB_APC_R-01_W-A-1_ROI-08_A-None.tif -> "None"
-# C-001_S-000_S_APC_R-01_W-A-1_ROI-08_A-VG_C-234TCR.tif -> "VG_C-234TCR"
-# The marker name follows "_A-" and continues until the file extension
-MACSIMA_PATTERN = r"_A-([^.]+)$"
+# C-001_S-000_S_APC_R-01_W-A-1_ROI-08_A-VG_C-234TCR.tif -> "VG"
+# The marker name follows "_A-" up to the next underscore or dot (strips _C_<Clone> suffix)
+MACSIMA_PATTERN = r"_A-([^_.]+)"
+
+# Pattern to detect MACSima DAPI files and extract their C-number
+# Matches: C-001_S-000_S_DAPI_R-01_W-A-1_ROI-08_A-DAPI.tif
+MACSIMA_DAPI_PATTERN = re.compile(r"^C-(\d+)_.*_S_DAPI_.*_A-DAPI\.", re.IGNORECASE)
 
 # Compiled default pattern
 _DEFAULT_MARKER_PATTERN = re.compile(MACSIMA_PATTERN)
+
+
+class FolderChannels(dict):
+    """Dict of channels with optional nuclear marker path.
+
+    Extends dict so it can be used anywhere a regular channel dict is expected,
+    while also carrying metadata about the auto-detected nuclear marker.
+    """
+
+    def __init__(self, *args, nuclear_path: Optional[Path] = None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.nuclear_path = nuclear_path
 
 
 def parse_channel_name(
@@ -105,7 +121,8 @@ def load_channel_folder(
     use_memmap: bool = True,
     exclude_channels: set[str] | list[str] | None = None,
     marker_pattern: Optional[Union[str, re.Pattern]] = None,
-) -> dict[str, np.ndarray]:
+    macsima_mode: bool = False,
+) -> Union[dict[str, np.ndarray], FolderChannels]:
     """Load all channel TIFFs from folder.
 
     Args:
@@ -118,9 +135,14 @@ def load_channel_folder(
         marker_pattern: Regex pattern to extract marker name from filename.
             Must contain one capture group. If None, uses MACSima pattern.
             See parse_channel_name() for examples.
+        macsima_mode: If True, enables MACSima-specific handling:
+            - Uses MACSIMA_PATTERN for marker name extraction
+            - Auto-detects DAPI files and keeps only the one with lowest C-number
+            - Returns FolderChannels with nuclear_path set
 
     Returns:
-        Dict mapping channel_name -> array (memory-mapped if use_memmap=True)
+        Dict mapping channel_name -> array (memory-mapped if use_memmap=True).
+        If macsima_mode=True, returns FolderChannels with nuclear_path attribute.
 
     Raises:
         FileNotFoundError: If folder doesn't exist
@@ -134,7 +156,9 @@ def load_channel_folder(
     if not folder_path.is_dir():
         raise ValueError(f"Path is not a directory: {folder_path}")
 
-    channels = {}
+    # Use MACSima pattern if macsima_mode and no custom pattern
+    if macsima_mode and marker_pattern is None:
+        marker_pattern = MACSIMA_PATTERN
 
     tiff_files = sorted(
         f for f in folder_path.iterdir()
@@ -144,7 +168,32 @@ def load_channel_folder(
     if not tiff_files:
         raise ValueError(f"No TIFF files found in {folder_path}")
 
+    # In MACSima mode, find DAPI files and select the one with lowest C-number
+    nuclear_path = None
+    dapi_files_to_skip = set()
+
+    if macsima_mode:
+        dapi_candidates = []
+        for tiff_file in tiff_files:
+            match = MACSIMA_DAPI_PATTERN.match(tiff_file.name)
+            if match:
+                c_number = int(match.group(1))
+                dapi_candidates.append((c_number, tiff_file))
+
+        if dapi_candidates:
+            # Sort by C-number, keep only the lowest
+            dapi_candidates.sort(key=lambda x: x[0])
+            nuclear_path = dapi_candidates[0][1]
+            # Skip all other DAPI files
+            dapi_files_to_skip = {f for _, f in dapi_candidates[1:]}
+
+    channels = {}
+
     for tiff_file in tiff_files:
+        # Skip duplicate DAPI files in MACSima mode
+        if tiff_file in dapi_files_to_skip:
+            continue
+
         channel_name = parse_channel_name(tiff_file.name, pattern=marker_pattern)
 
         # Skip excluded channels
@@ -162,6 +211,9 @@ def load_channel_folder(
         raise ValueError(
             f"No channels loaded from {folder_path} after applying exclusions"
         )
+
+    if macsima_mode:
+        return FolderChannels(channels, nuclear_path=nuclear_path)
 
     return channels
 
@@ -429,6 +481,50 @@ def load_ome_tiff(
         )
 
     return channels
+
+
+def detect_input_mode(
+    channel_folder: Optional[Union[str, Path]],
+    ome_tiff_path: Optional[Union[str, Path]],
+    marker_file: Optional[Union[str, Path]],
+    prefer_ome_tiff: bool = False,
+) -> str:
+    """Detect which input mode to use based on provided paths.
+
+    Args:
+        channel_folder: Path to folder with channel TIFFs (or None)
+        ome_tiff_path: Path to OME-TIFF file (or None)
+        marker_file: Path to marker names file (required for OME-TIFF)
+        prefer_ome_tiff: If both inputs available, prefer OME-TIFF
+
+    Returns:
+        'folder' or 'ome_tiff'
+
+    Raises:
+        ValueError: If no valid input configuration detected
+    """
+    has_folder = channel_folder is not None and Path(channel_folder).is_dir()
+    has_ome_tiff = (
+        ome_tiff_path is not None
+        and Path(ome_tiff_path).is_file()
+        and marker_file is not None
+        and Path(marker_file).is_file()
+    )
+
+    if has_folder and has_ome_tiff:
+        return 'ome_tiff' if prefer_ome_tiff else 'folder'
+    elif has_folder:
+        return 'folder'
+    elif has_ome_tiff:
+        return 'ome_tiff'
+    elif ome_tiff_path is not None and marker_file is None:
+        raise ValueError("OME-TIFF path provided but marker file is missing")
+    else:
+        raise ValueError(
+            "No valid input detected. Provide either:\n"
+            "  - channel_folder (path to folder with TIFF files)\n"
+            "  - ome_tiff_path and marker_file (for OME-TIFF input)"
+        )
 
 
 class OMETiffChannels:

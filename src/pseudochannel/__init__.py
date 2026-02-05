@@ -10,6 +10,8 @@ This package provides tools for:
 from .io import (
     DEFAULT_EXCLUDED_CHANNELS,
     MACSIMA_PATTERN,
+    FolderChannels,
+    detect_input_mode,
     load_channel_folder,
     load_marker_names,
     load_mcmicro_markers,
@@ -28,6 +30,8 @@ __version__ = "0.1.0"
 __all__ = [
     "DEFAULT_EXCLUDED_CHANNELS",
     "MACSIMA_PATTERN",
+    "FolderChannels",
+    "detect_input_mode",
     "load_channel_folder",
     "load_marker_names",
     "load_mcmicro_markers",

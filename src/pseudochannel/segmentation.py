@@ -4,7 +4,7 @@ Cellpose is an optional dependency — all imports happen inside functions
 so this module loads without it installed.
 """
 
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, asdict
 from typing import Optional
 
 import numpy as np
