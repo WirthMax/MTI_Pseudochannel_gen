@@ -351,28 +351,28 @@ def find_mcmicro_experiments(
 ) -> list[dict]:
     """Find MCMICRO experiment folders with background images.
 
-    Looks for experiment folders containing a background subfolder
-    with an OME-TIFF image and markers.csv file.
+    Recursively searches for 'background' folders containing an OME-TIFF
+    image and markers.csv file. Supports nested folder structures like:
+
+        root/EXP_.../1/rack-.../background/
 
     Args:
-        root_path: Root directory containing experiment folders
-        background_folder: Name of subfolder containing the image (default: "background")
+        root_path: Root directory to search
+        background_folder: Name of folder containing the image (default: "background")
         marker_filename: Name of marker file (default: "markers.csv")
 
     Returns:
         List of dicts with keys:
-        - experiment_path: Path to experiment folder
+        - experiment_path: Path to top-level experiment folder (for naming)
+        - background_path: Path to background folder (for output placement)
         - image_path: Path to OME-TIFF image
         - marker_path: Path to markers.csv
     """
     root_path = Path(root_path)
     experiments = []
 
-    for experiment_dir in sorted(root_path.iterdir()):
-        if not experiment_dir.is_dir():
-            continue
-
-        bg_dir = experiment_dir / background_folder
+    # Recursively find all 'background' folders
+    for bg_dir in root_path.rglob(background_folder):
         if not bg_dir.is_dir():
             continue
 
@@ -394,13 +394,23 @@ def find_mcmicro_experiments(
         if image_path is None:
             continue
 
+        # Find top-level experiment folder (first child of root_path in the path)
+        # e.g., root/EXP_.../1/rack-.../background -> EXP_...
+        try:
+            relative = bg_dir.relative_to(root_path)
+            experiment_name = relative.parts[0]
+            experiment_path = root_path / experiment_name
+        except (ValueError, IndexError):
+            experiment_path = bg_dir.parent
+
         experiments.append({
-            "experiment_path": experiment_dir,
+            "experiment_path": experiment_path,
+            "background_path": bg_dir,
             "image_path": image_path,
             "marker_path": marker_path,
         })
 
-    return experiments
+    return sorted(experiments, key=lambda x: str(x["image_path"]))
 
 
 def process_mcmicro_experiment(
@@ -430,9 +440,9 @@ def process_mcmicro_experiment(
     Returns:
         Path to saved output file
     """
-    experiment_path = experiment_info["experiment_path"]
     image_path = experiment_info["image_path"]
     marker_path = experiment_info["marker_path"]
+    background_path = experiment_info["background_path"]
 
     # Load channels
     channels = OMETiffChannels(
@@ -457,8 +467,9 @@ def process_mcmicro_experiment(
             normalize=normalization,
         )
 
-    # Save output
-    output_dir = experiment_path / output_folder
+    # Save output as sibling to background folder
+    # e.g., .../rack-.../background/ -> .../rack-.../pseudochannel/
+    output_dir = background_path.parent / output_folder
     output_dir.mkdir(parents=True, exist_ok=True)
     output_path = output_dir / output_filename
 
@@ -490,18 +501,20 @@ def process_mcmicro_batch(
 ) -> list[Path]:
     """Batch process MCMICRO experiment folders.
 
-    Finds all experiment folders with a background subfolder containing
-    an OME-TIFF and markers.csv, processes each, and saves output to
-    a pseudochannel subfolder within each experiment.
+    Recursively finds all 'background' folders containing an OME-TIFF
+    and markers.csv, processes each, and saves output to a sibling
+    'pseudochannel' folder.
 
-    Expected folder structure:
+    Supports nested folder structures like:
         root_path/
-        ├── experiment1/
-        │   ├── background/
-        │   │   ├── image.ome.tiff
-        │   │   └── markers.csv
-        │   └── pseudochannel/  <- output created here
-        ├── experiment2/
+        ├── EXP_.../
+        │   └── 1/
+        │       └── rack-.../
+        │           ├── background/
+        │           │   ├── image.ome.tiff
+        │           │   └── markers.csv
+        │           └── pseudochannel/  <- output created here
+        ├── EXP_.../
         │   └── ...
 
     Args:
@@ -532,15 +545,19 @@ def process_mcmicro_batch(
 
     if not experiments:
         print(f"No MCMICRO experiments found in {root_path}")
-        print(f"  (looking for '{background_folder}/' with '{marker_filename}' and an image)")
+        print(f"  (looking for '{background_folder}/' folders with '{marker_filename}' and a TIFF image)")
         return []
 
-    print(f"Found {len(experiments)} MCMICRO experiments to process")
+    print(f"Found {len(experiments)} MCMICRO experiments to process:")
+    for exp in experiments[:5]:
+        print(f"  {exp['experiment_path'].name} -> {exp['background_path'].parent.name}/{background_folder}/")
+    if len(experiments) > 5:
+        print(f"  ... and {len(experiments) - 5} more")
 
     outputs = []
 
     if progress and tqdm is not None:
-        iterator = tqdm(experiments, desc="Processing experiments")
+        iterator = tqdm(experiments, desc="Processing")
     else:
         iterator = experiments
 
@@ -561,7 +578,8 @@ def process_mcmicro_batch(
 
         except Exception as e:
             exp_name = exp_info["experiment_path"].name
-            print(f"Error processing {exp_name}: {e}")
+            img_name = exp_info["image_path"].name
+            print(f"Error processing {exp_name}/{img_name}: {e}")
             continue
 
     return outputs
