@@ -13,7 +13,7 @@ except ImportError:
 
 from .config import get_normalization_from_config, get_weights_from_config, load_config
 from .core import compute_pseudochannel, compute_pseudochannel_chunked
-from .io import load_channel_folder, load_ome_tiff, validate_channels
+from .io import load_channel_folder, load_ome_tiff, OMETiffChannels, validate_channels
 
 
 def process_single_folder(
@@ -342,3 +342,226 @@ def batch_process_directory(
         output_folder,
         **kwargs,
     )
+
+
+def find_mcmicro_experiments(
+    root_path: Union[str, Path],
+    background_folder: str = "background",
+    marker_filename: str = "markers.csv",
+) -> list[dict]:
+    """Find MCMICRO experiment folders with background images.
+
+    Looks for experiment folders containing a background subfolder
+    with an OME-TIFF image and markers.csv file.
+
+    Args:
+        root_path: Root directory containing experiment folders
+        background_folder: Name of subfolder containing the image (default: "background")
+        marker_filename: Name of marker file (default: "markers.csv")
+
+    Returns:
+        List of dicts with keys:
+        - experiment_path: Path to experiment folder
+        - image_path: Path to OME-TIFF image
+        - marker_path: Path to markers.csv
+    """
+    root_path = Path(root_path)
+    experiments = []
+
+    for experiment_dir in sorted(root_path.iterdir()):
+        if not experiment_dir.is_dir():
+            continue
+
+        bg_dir = experiment_dir / background_folder
+        if not bg_dir.is_dir():
+            continue
+
+        # Find marker file
+        marker_path = bg_dir / marker_filename
+        if not marker_path.is_file():
+            continue
+
+        # Find OME-TIFF image (look for common patterns)
+        image_path = None
+        for pattern in ["*.ome.tiff", "*.ome.tif", "*.tiff", "*.tif"]:
+            matches = list(bg_dir.glob(pattern))
+            # Exclude marker files and other CSVs
+            matches = [m for m in matches if m.suffix.lower() in (".tif", ".tiff")]
+            if matches:
+                image_path = matches[0]
+                break
+
+        if image_path is None:
+            continue
+
+        experiments.append({
+            "experiment_path": experiment_dir,
+            "image_path": image_path,
+            "marker_path": marker_path,
+        })
+
+    return experiments
+
+
+def process_mcmicro_experiment(
+    experiment_info: dict,
+    weights: dict[str, float],
+    normalization: str = "minmax",
+    output_folder: str = "pseudochannel",
+    output_filename: str = "pseudochannel.tif",
+    mcmicro_markers: bool = True,
+    use_chunked: bool = True,
+    chunk_size: int = 1024,
+    output_dtype: str = "uint16",
+) -> Path:
+    """Process a single MCMICRO experiment.
+
+    Args:
+        experiment_info: Dict from find_mcmicro_experiments()
+        weights: Dict of channel_name -> weight
+        normalization: Normalization method
+        output_folder: Subfolder name for output (default: "pseudochannel")
+        output_filename: Output filename (default: "pseudochannel.tif")
+        mcmicro_markers: Use MCMICRO marker format (default: True)
+        use_chunked: Use chunked processing for memory efficiency
+        chunk_size: Chunk size for chunked processing
+        output_dtype: Output data type ("uint16" or "float32")
+
+    Returns:
+        Path to saved output file
+    """
+    experiment_path = experiment_info["experiment_path"]
+    image_path = experiment_info["image_path"]
+    marker_path = experiment_info["marker_path"]
+
+    # Load channels
+    channels = OMETiffChannels(
+        image_path,
+        marker_path,
+        mcmicro_markers=mcmicro_markers,
+    )
+    validate_channels(channels)
+
+    # Compute pseudochannel
+    if use_chunked:
+        result = compute_pseudochannel_chunked(
+            channels,
+            weights,
+            normalize=normalization,
+            chunk_size=chunk_size,
+        )
+    else:
+        result = compute_pseudochannel(
+            channels,
+            weights,
+            normalize=normalization,
+        )
+
+    # Save output
+    output_dir = experiment_path / output_folder
+    output_dir.mkdir(parents=True, exist_ok=True)
+    output_path = output_dir / output_filename
+
+    if output_dtype == "uint16":
+        output_data = (result * 65535).astype(np.uint16)
+    else:
+        output_data = result
+
+    tifffile.imwrite(str(output_path), output_data)
+
+    # Close the OMETiffChannels to release file handle
+    channels.close()
+
+    return output_path
+
+
+def process_mcmicro_batch(
+    root_path: Union[str, Path],
+    config_path: Union[str, Path],
+    background_folder: str = "background",
+    marker_filename: str = "markers.csv",
+    output_folder: str = "pseudochannel",
+    output_filename: str = "pseudochannel.tif",
+    mcmicro_markers: bool = True,
+    use_chunked: bool = True,
+    chunk_size: int = 1024,
+    output_dtype: str = "uint16",
+    progress: bool = True,
+) -> list[Path]:
+    """Batch process MCMICRO experiment folders.
+
+    Finds all experiment folders with a background subfolder containing
+    an OME-TIFF and markers.csv, processes each, and saves output to
+    a pseudochannel subfolder within each experiment.
+
+    Expected folder structure:
+        root_path/
+        ├── experiment1/
+        │   ├── background/
+        │   │   ├── image.ome.tiff
+        │   │   └── markers.csv
+        │   └── pseudochannel/  <- output created here
+        ├── experiment2/
+        │   └── ...
+
+    Args:
+        root_path: Root directory containing experiment folders
+        config_path: Path to YAML config file with weights
+        background_folder: Name of subfolder containing images (default: "background")
+        marker_filename: Name of marker file (default: "markers.csv")
+        output_folder: Subfolder name for outputs (default: "pseudochannel")
+        output_filename: Output filename (default: "pseudochannel.tif")
+        mcmicro_markers: Use MCMICRO marker format (default: True)
+        use_chunked: Use chunked processing for memory efficiency
+        chunk_size: Chunk size for chunked processing
+        output_dtype: Output data type ("uint16" or "float32")
+        progress: Show progress bar
+
+    Returns:
+        List of paths to saved output files
+    """
+    config = load_config(config_path)
+    weights = get_weights_from_config(config)
+    normalization = get_normalization_from_config(config)
+
+    experiments = find_mcmicro_experiments(
+        root_path,
+        background_folder=background_folder,
+        marker_filename=marker_filename,
+    )
+
+    if not experiments:
+        print(f"No MCMICRO experiments found in {root_path}")
+        print(f"  (looking for '{background_folder}/' with '{marker_filename}' and an image)")
+        return []
+
+    print(f"Found {len(experiments)} MCMICRO experiments to process")
+
+    outputs = []
+
+    if progress and tqdm is not None:
+        iterator = tqdm(experiments, desc="Processing experiments")
+    else:
+        iterator = experiments
+
+    for exp_info in iterator:
+        try:
+            result_path = process_mcmicro_experiment(
+                exp_info,
+                weights,
+                normalization=normalization,
+                output_folder=output_folder,
+                output_filename=output_filename,
+                mcmicro_markers=mcmicro_markers,
+                use_chunked=use_chunked,
+                chunk_size=chunk_size,
+                output_dtype=output_dtype,
+            )
+            outputs.append(result_path)
+
+        except Exception as e:
+            exp_name = exp_info["experiment_path"].name
+            print(f"Error processing {exp_name}: {e}")
+            continue
+
+    return outputs

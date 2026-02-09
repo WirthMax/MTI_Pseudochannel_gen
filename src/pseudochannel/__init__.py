@@ -23,7 +23,7 @@ from .core import compute_pseudochannel
 from .preview import create_preview_stack, downsample_image
 from .config import save_config, load_config
 from .segmentation import CellposeConfig, run_segmentation, extract_mask_contours
-from .batch import process_dataset
+from .batch import process_dataset, find_mcmicro_experiments, process_mcmicro_batch
 
 __version__ = "0.1.0"
 
@@ -47,4 +47,6 @@ __all__ = [
     "run_segmentation",
     "extract_mask_contours",
     "process_dataset",
+    "find_mcmicro_experiments",
+    "process_mcmicro_batch",
 ]
