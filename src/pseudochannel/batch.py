@@ -352,9 +352,13 @@ def find_mcmicro_experiments(
     """Find MCMICRO experiment folders with background images.
 
     Recursively searches for 'background' folders containing an OME-TIFF
-    image and markers.csv file. Supports nested folder structures like:
+    image, with markers.csv in the parent folder. Supports nested structures:
 
-        root/EXP_.../1/rack-.../background/
+        root/EXP_.../1/rack-.../
+        ├── markers.csv          <- marker file here
+        ├── background/          <- image here
+        │   └── image.ome.tiff
+        └── pseudochannel/       <- output goes here
 
     Args:
         root_path: Root directory to search
@@ -376,16 +380,15 @@ def find_mcmicro_experiments(
         if not bg_dir.is_dir():
             continue
 
-        # Find marker file
-        marker_path = bg_dir / marker_filename
+        # Find marker file in parent folder (sibling to background)
+        marker_path = bg_dir.parent / marker_filename
         if not marker_path.is_file():
             continue
 
-        # Find OME-TIFF image (look for common patterns)
+        # Find OME-TIFF image inside background folder
         image_path = None
         for pattern in ["*.ome.tiff", "*.ome.tif", "*.tiff", "*.tif"]:
             matches = list(bg_dir.glob(pattern))
-            # Exclude marker files and other CSVs
             matches = [m for m in matches if m.suffix.lower() in (".tif", ".tiff")]
             if matches:
                 image_path = matches[0]
