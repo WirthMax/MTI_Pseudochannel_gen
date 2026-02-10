@@ -5,9 +5,18 @@ so this module loads without it installed.
 """
 
 from dataclasses import dataclass, asdict
-from typing import Optional
+from typing import NamedTuple, Optional
 
 import numpy as np
+
+
+class SegmentationResult(NamedTuple):
+    """Full segmentation results from Cellpose."""
+
+    masks: np.ndarray  # (H, W) uint32 label mask
+    flows: list  # Cellpose flow arrays
+    styles: np.ndarray  # Style vectors
+    diams: float  # Estimated diameter
 
 
 def _gpu_available() -> bool:
@@ -125,6 +134,54 @@ def run_segmentation(
     )
 
     return masks
+
+
+def run_segmentation_full(
+    model,
+    pseudochannel: np.ndarray,
+    nuclear: Optional[np.ndarray],
+    config: CellposeConfig,
+) -> SegmentationResult:
+    """Run Cellpose segmentation and return full results.
+
+    Same as run_segmentation() but returns the full SegmentationResult
+    including flows, styles, and estimated diameter for saving/reconstruction.
+
+    Args:
+        model: Cellpose model from create_cellpose_model().
+        pseudochannel: (H, W) float32 array in [0, 1].
+        nuclear: Optional (H, W) float32 nuclear marker in [0, 1].
+        config: CellposeConfig with eval parameters.
+
+    Returns:
+        SegmentationResult with masks, flows, styles, and estimated diameter.
+    """
+    # Scale from [0, 1] to [0, 255] for Cellpose
+    pseudo_u8 = (np.clip(pseudochannel, 0, 1) * 255).astype(np.float32)
+
+    if nuclear is not None:
+        nuclear_u8 = (np.clip(nuclear, 0, 1) * 255).astype(np.float32)
+        img = np.stack([pseudo_u8, nuclear_u8], axis=-1)  # (H, W, 2)
+        channels = [1, 2]  # cyto=ch1, nuc=ch2
+    else:
+        img = pseudo_u8  # (H, W)
+        channels = [0, 0]  # grayscale
+
+    masks, flows, styles, diams = model.eval(
+        img,
+        diameter=config.diameter,
+        channels=channels,
+        flow_threshold=config.flow_threshold,
+        cellprob_threshold=config.cellprob_threshold,
+        min_size=config.min_size,
+    )
+
+    return SegmentationResult(
+        masks=masks.astype(np.uint32),
+        flows=flows,
+        styles=styles,
+        diams=diams,
+    )
 
 
 def extract_mask_contours(masks: np.ndarray) -> list[np.ndarray]:

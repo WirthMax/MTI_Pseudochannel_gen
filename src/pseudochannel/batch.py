@@ -2,6 +2,7 @@
 
 from pathlib import Path
 from typing import Optional, Union
+import warnings
 
 import numpy as np
 import tifffile
@@ -14,6 +15,12 @@ except ImportError:
 from .config import get_normalization_from_config, get_weights_from_config, load_config
 from .core import compute_pseudochannel, compute_pseudochannel_chunked
 from .io import load_channel_folder, load_ome_tiff, OMETiffChannels, validate_channels
+from .segmentation import (
+    CellposeConfig,
+    SegmentationResult,
+    create_cellpose_model,
+    run_segmentation_full,
+)
 
 
 def process_single_folder(
@@ -607,3 +614,362 @@ def process_mcmicro_batch(
             continue
 
     return outputs
+
+
+# =============================================================================
+# Batch Segmentation Functions
+# =============================================================================
+
+
+def find_nuclear_marker_index(marker_names: list[str]) -> Optional[int]:
+    """Find the index of a nuclear marker in a list of marker names.
+
+    Searches for common nuclear marker keywords (case-insensitive):
+    dapi, hoechst, nuclear, nuclei.
+
+    Args:
+        marker_names: List of marker names.
+
+    Returns:
+        Index of the first nuclear marker found, or None if not found.
+    """
+    nuclear_keywords = {"dapi", "hoechst", "nuclear", "nuclei"}
+
+    for i, name in enumerate(marker_names):
+        name_lower = name.lower()
+        # Check for exact match or keyword substring
+        if name_lower in nuclear_keywords or any(kw in name_lower for kw in nuclear_keywords):
+            return i
+
+    return None
+
+
+def segment_mcmicro_experiment(
+    experiment_info: dict,
+    config: CellposeConfig,
+    model=None,
+    pseudochannel_folder: str = "pseudochannel",
+    pseudochannel_filename: str = "pseudochannel.tif",
+    segmentation_folder: str = "segmentation",
+    mask_filename: str = "seg_mask.tif",
+    flows_filename: str = "seg_flows.npy",
+    mcmicro_markers: bool = True,
+) -> tuple[Optional[Path], Optional[Path]]:
+    """Segment a single MCMICRO experiment.
+
+    Loads the pseudochannel and nuclear marker (DAPI), runs Cellpose
+    segmentation, and saves the mask and flows.
+
+    Args:
+        experiment_info: Dict from find_mcmicro_experiments().
+        config: CellposeConfig with segmentation parameters.
+        model: Pre-created Cellpose model (if None, will be created).
+        pseudochannel_folder: Subfolder containing pseudochannel image.
+        pseudochannel_filename: Filename of pseudochannel image.
+        segmentation_folder: Output subfolder for segmentation results.
+        mask_filename: Output filename for segmentation mask.
+        flows_filename: Output filename for Cellpose flows.
+        mcmicro_markers: Use MCMICRO marker format for loading channels.
+
+    Returns:
+        Tuple of (mask_path, flows_path), or (None, None) on error.
+    """
+    background_path = experiment_info["background_path"]
+    image_path = experiment_info["image_path"]
+    marker_path = experiment_info["marker_path"]
+
+    # Locate pseudochannel image
+    pseudo_dir = background_path.parent / pseudochannel_folder
+    pseudo_path = pseudo_dir / pseudochannel_filename
+
+    if not pseudo_path.exists():
+        print(f"  Missing pseudochannel: {pseudo_path}")
+        return (None, None)
+
+    # Load pseudochannel (convert to float32 [0, 1])
+    pseudo_data = tifffile.imread(str(pseudo_path))
+    if pseudo_data.dtype == np.uint16:
+        pseudochannel = pseudo_data.astype(np.float32) / 65535.0
+    elif pseudo_data.dtype == np.uint8:
+        pseudochannel = pseudo_data.astype(np.float32) / 255.0
+    else:
+        pseudochannel = pseudo_data.astype(np.float32)
+        # Normalize if not already in [0, 1]
+        if pseudochannel.max() > 1.0:
+            pseudochannel = pseudochannel / pseudochannel.max()
+
+    # Load nuclear marker from OME-TIFF
+    nuclear = None
+    try:
+        channels = OMETiffChannels(
+            image_path,
+            marker_path,
+            mcmicro_markers=mcmicro_markers,
+        )
+        marker_names = channels._all_marker_names
+        nuclear_idx = find_nuclear_marker_index(marker_names)
+
+        if nuclear_idx is not None:
+            nuclear_raw = channels.get_channel_by_index(nuclear_idx)
+            # Normalize nuclear marker
+            nuclear = nuclear_raw.astype(np.float32)
+            vmin, vmax = np.percentile(nuclear, [1, 99])
+            if vmax > vmin:
+                nuclear = np.clip((nuclear - vmin) / (vmax - vmin), 0, 1)
+            else:
+                nuclear = np.zeros_like(nuclear)
+        else:
+            warnings.warn(
+                f"No nuclear marker found in {marker_path.name}, "
+                "proceeding with grayscale segmentation"
+            )
+        channels.close()
+    except Exception as e:
+        warnings.warn(f"Error loading nuclear marker: {e}, proceeding with grayscale")
+
+    # Create model if not provided
+    if model is None:
+        model = create_cellpose_model(config)
+
+    # Run segmentation
+    result = run_segmentation_full(model, pseudochannel, nuclear, config)
+
+    # Save results
+    seg_dir = background_path.parent / segmentation_folder
+    seg_dir.mkdir(parents=True, exist_ok=True)
+
+    mask_path = seg_dir / mask_filename
+    flows_path = seg_dir / flows_filename
+
+    # Save mask as uint32 TIFF
+    tifffile.imwrite(str(mask_path), result.masks.astype(np.uint32))
+
+    # Save flows as numpy archive (allow_pickle needed for reconstruction)
+    np.save(str(flows_path), result.flows, allow_pickle=True)
+
+    return (mask_path, flows_path)
+
+
+def segment_mcmicro_batch(
+    root_path: Union[str, Path],
+    config: Optional[Union[str, Path, CellposeConfig]] = None,
+    background_folder: str = "background",
+    marker_filename: str = "markers.csv",
+    pseudochannel_folder: str = "pseudochannel",
+    pseudochannel_filename: str = "pseudochannel.tif",
+    segmentation_folder: str = "segmentation",
+    mask_filename: str = "seg_mask.tif",
+    flows_filename: str = "seg_flows.npy",
+    mcmicro_markers: bool = True,
+    progress: bool = True,
+    overwrite: bool = False,
+) -> list[tuple[Path, Path]]:
+    """Batch segment MCMICRO experiments that have pseudochannel images.
+
+    Finds experiments with existing pseudochannel images, runs Cellpose
+    segmentation on each, and saves masks and flows to a sibling
+    'segmentation' folder.
+
+    Args:
+        root_path: Root directory containing experiment folders.
+        config: Cellpose configuration. Can be:
+            - Path to YAML config (extracts 'cellpose' section)
+            - CellposeConfig instance
+            - None (uses defaults: auto GPU, cyto3 model)
+        background_folder: Name of subfolder containing images.
+        marker_filename: Name of marker file.
+        pseudochannel_folder: Subfolder containing pseudochannel images.
+        pseudochannel_filename: Filename of pseudochannel image.
+        segmentation_folder: Output subfolder for segmentation results.
+        mask_filename: Output filename for segmentation mask.
+        flows_filename: Output filename for Cellpose flows.
+        mcmicro_markers: Use MCMICRO marker format.
+        progress: Show progress bar.
+        overwrite: If False (default), skip already segmented experiments.
+
+    Returns:
+        List of (mask_path, flows_path) tuples for successfully segmented
+        experiments.
+    """
+    # Parse config
+    if config is None:
+        cellpose_config = CellposeConfig()
+    elif isinstance(config, CellposeConfig):
+        cellpose_config = config
+    elif isinstance(config, (str, Path)):
+        yaml_config = load_config(config)
+        cellpose_section = yaml_config.get("cellpose", {})
+        cellpose_config = CellposeConfig.from_dict(cellpose_section)
+    else:
+        raise TypeError(
+            f"config must be Path, CellposeConfig, or None, got {type(config)}"
+        )
+
+    # Find experiments
+    experiments = find_mcmicro_experiments(
+        root_path,
+        background_folder=background_folder,
+        marker_filename=marker_filename,
+    )
+
+    if not experiments:
+        print(f"No MCMICRO experiments found in {root_path}")
+        return []
+
+    # Filter to only those with pseudochannel images
+    with_pseudo = []
+    for exp_info in experiments:
+        pseudo_path = (
+            exp_info["background_path"].parent
+            / pseudochannel_folder
+            / pseudochannel_filename
+        )
+        if pseudo_path.exists():
+            with_pseudo.append(exp_info)
+
+    if not with_pseudo:
+        print(f"No experiments with pseudochannel images found")
+        print(f"  (looking for '{pseudochannel_folder}/{pseudochannel_filename}')")
+        return []
+
+    # Filter out already segmented unless overwrite=True
+    if not overwrite:
+        to_segment = []
+        skipped = 0
+        for exp_info in with_pseudo:
+            mask_path = (
+                exp_info["background_path"].parent
+                / segmentation_folder
+                / mask_filename
+            )
+            if mask_path.exists():
+                skipped += 1
+            else:
+                to_segment.append(exp_info)
+        with_pseudo = to_segment
+        if skipped > 0:
+            print(
+                f"Skipping {skipped} already segmented experiments "
+                "(use overwrite=True to recompute)"
+            )
+
+    if not with_pseudo:
+        print("All experiments already segmented.")
+        return []
+
+    print(f"Segmenting {len(with_pseudo)} experiments:")
+    for exp in with_pseudo[:5]:
+        print(f"  {exp['experiment_path'].name}")
+    if len(with_pseudo) > 5:
+        print(f"  ... and {len(with_pseudo) - 5} more")
+
+    # Create model once and reuse
+    model = create_cellpose_model(cellpose_config)
+
+    outputs = []
+
+    if progress and tqdm is not None:
+        iterator = tqdm(with_pseudo, desc="Segmenting")
+    else:
+        iterator = with_pseudo
+
+    for exp_info in iterator:
+        try:
+            mask_path, flows_path = segment_mcmicro_experiment(
+                exp_info,
+                cellpose_config,
+                model=model,
+                pseudochannel_folder=pseudochannel_folder,
+                pseudochannel_filename=pseudochannel_filename,
+                segmentation_folder=segmentation_folder,
+                mask_filename=mask_filename,
+                flows_filename=flows_filename,
+                mcmicro_markers=mcmicro_markers,
+            )
+            if mask_path is not None:
+                outputs.append((mask_path, flows_path))
+        except Exception as e:
+            exp_name = exp_info["experiment_path"].name
+            print(f"Error segmenting {exp_name}: {e}")
+            continue
+
+    return outputs
+
+
+def process_and_segment_mcmicro_batch(
+    root_path: Union[str, Path],
+    config_path: Union[str, Path],
+    cellpose_config: Optional[Union[str, Path, CellposeConfig]] = None,
+    background_folder: str = "background",
+    marker_filename: str = "markers.csv",
+    pseudochannel_folder: str = "pseudochannel",
+    pseudochannel_filename: str = "pseudochannel.tif",
+    segmentation_folder: str = "segmentation",
+    mask_filename: str = "seg_mask.tif",
+    flows_filename: str = "seg_flows.npy",
+    mcmicro_markers: bool = True,
+    progress: bool = True,
+    overwrite_pseudochannel: bool = False,
+    overwrite_segmentation: bool = False,
+) -> tuple[list[Path], list[tuple[Path, Path]]]:
+    """Generate pseudochannels and segment MCMICRO experiments in one call.
+
+    Convenience function that runs process_mcmicro_batch() to generate
+    pseudochannels, then segment_mcmicro_batch() to segment them.
+
+    Args:
+        root_path: Root directory containing experiment folders.
+        config_path: Path to YAML config with pseudochannel weights.
+        cellpose_config: Cellpose configuration (see segment_mcmicro_batch).
+            If None and config_path has a 'cellpose' section, uses that.
+        background_folder: Name of subfolder containing images.
+        marker_filename: Name of marker file.
+        pseudochannel_folder: Subfolder for pseudochannel outputs.
+        pseudochannel_filename: Filename for pseudochannel image.
+        segmentation_folder: Subfolder for segmentation outputs.
+        mask_filename: Output filename for segmentation mask.
+        flows_filename: Output filename for Cellpose flows.
+        mcmicro_markers: Use MCMICRO marker format.
+        progress: Show progress bar.
+        overwrite_pseudochannel: Overwrite existing pseudochannel images.
+        overwrite_segmentation: Overwrite existing segmentation results.
+
+    Returns:
+        Tuple of (pseudochannel_paths, segmentation_paths) where:
+        - pseudochannel_paths: List of paths to generated pseudochannel images
+        - segmentation_paths: List of (mask_path, flows_path) tuples
+    """
+    # Generate pseudochannels
+    pseudo_paths = process_mcmicro_batch(
+        root_path=root_path,
+        config_path=config_path,
+        background_folder=background_folder,
+        marker_filename=marker_filename,
+        output_folder=pseudochannel_folder,
+        output_filename=pseudochannel_filename,
+        mcmicro_markers=mcmicro_markers,
+        progress=progress,
+        overwrite=overwrite_pseudochannel,
+    )
+
+    # Use cellpose section from config if not provided explicitly
+    if cellpose_config is None:
+        cellpose_config = config_path
+
+    # Segment
+    seg_paths = segment_mcmicro_batch(
+        root_path=root_path,
+        config=cellpose_config,
+        background_folder=background_folder,
+        marker_filename=marker_filename,
+        pseudochannel_folder=pseudochannel_folder,
+        pseudochannel_filename=pseudochannel_filename,
+        segmentation_folder=segmentation_folder,
+        mask_filename=mask_filename,
+        flows_filename=flows_filename,
+        mcmicro_markers=mcmicro_markers,
+        progress=progress,
+        overwrite=overwrite_segmentation,
+    )
+
+    return (pseudo_paths, seg_paths)

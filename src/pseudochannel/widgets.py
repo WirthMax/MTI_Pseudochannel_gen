@@ -1015,6 +1015,19 @@ class PseudochannelExplorer:
                 self.sliders[name].value = value
         self._update_preview()
 
+    def get_cellpose_config(self) -> CellposeConfig:
+        """Export the current Cellpose configuration for batch processing.
+
+        Syncs the widget slider values to the internal config and returns
+        a copy that can be used with segment_mcmicro_batch() or other
+        batch processing functions.
+
+        Returns:
+            CellposeConfig with current widget parameter values.
+        """
+        self._sync_cellpose_config()
+        return self._cellpose_config
+
     def close(self):
         """Close figures and clean up resources."""
         if self._preview_fig is not None:

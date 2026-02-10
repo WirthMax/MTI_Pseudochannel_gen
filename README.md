@@ -16,6 +16,7 @@ The solution: blend multiple channels together with different weights until you 
 
 - **Interactive weight tuning** with real-time preview
 - **Cellpose segmentation preview** - test your pseudochannel directly in the zoom view
+- **Batch segmentation** - run Cellpose on entire MCMICRO experiment folders
 - **Auto DAPI detection** for both OME-TIFF and MACSima folder formats
 - **GPU acceleration** - auto-detects CUDA when available
 - **Batch processing** - apply weights to entire datasets
@@ -111,6 +112,12 @@ Once you have a zoom region selected, you can preview Cellpose segmentation dire
 
 Cellpose uses your current pseudochannel weights and the nuclear marker (if available) for two-channel segmentation.
 
+**Export config for batch processing**: Once you've tuned the segmentation parameters, export them for use with `segment_mcmicro_batch()`:
+
+```python
+cellpose_config = explorer.get_cellpose_config()
+```
+
 **Note**: Cellpose is an optional dependency. Install it with:
 ```bash
 pip install cellpose
@@ -146,6 +153,86 @@ batch_process_directory(
 )
 ```
 
+#### MCMICRO Batch Processing
+
+For MCMICRO-style folder structures, use `process_mcmicro_batch()`. It recursively finds all experiments with a `background/` folder containing an OME-TIFF and a sibling `markers.csv`:
+
+```python
+from pseudochannel import find_mcmicro_experiments, process_mcmicro_batch
+
+# Preview what will be processed
+experiments = find_mcmicro_experiments("/data/CRC/")
+print(f"Found {len(experiments)} experiments")
+
+# Process all experiments
+output_paths = process_mcmicro_batch(
+    root_path="/data/CRC/",
+    config_path="configs/membrane_weights.yaml",
+    mcmicro_markers=True,  # Uses marker_name column, filters remove=TRUE
+)
+```
+
+Output structure:
+```
+experiment/
+├── markers.csv
+├── background/
+│   └── image.ome.tiff
+└── pseudochannel/           <- Created
+    └── pseudochannel.tif
+```
+
+### 5. Batch segmentation
+
+After generating pseudochannels, run Cellpose segmentation on all experiments:
+
+```python
+from pseudochannel import segment_mcmicro_batch
+
+seg_outputs = segment_mcmicro_batch(
+    root_path="/data/CRC/",
+    config=explorer.get_cellpose_config(),  # Use tuned parameters from widget
+    mcmicro_markers=True,
+)
+print(f"Segmented {len(seg_outputs)} experiments")
+```
+
+Or do both pseudochannel generation and segmentation in one call:
+
+```python
+from pseudochannel import process_and_segment_mcmicro_batch
+
+pseudo_paths, seg_paths = process_and_segment_mcmicro_batch(
+    root_path="/data/CRC/",
+    config_path="configs/membrane_weights.yaml",
+    mcmicro_markers=True,
+)
+```
+
+**Config options for segmentation:**
+
+| Source | Usage |
+|--------|-------|
+| Widget explorer | `config=explorer.get_cellpose_config()` |
+| YAML file | `config="path/to/config.yaml"` (extracts `cellpose` section) |
+| Direct | `config=CellposeConfig(diameter=30, flow_threshold=0.4)` |
+| Defaults | `config=None` (auto GPU, cyto3 model) |
+
+Output structure after segmentation:
+```
+experiment/
+├── markers.csv
+├── background/
+│   └── image.ome.tiff
+├── pseudochannel/
+│   └── pseudochannel.tif
+└── segmentation/            <- Created
+    ├── seg_mask.tif        <- uint32 label mask
+    └── seg_flows.npy       <- Cellpose flows for reconstruction
+```
+
+**Skip-existing behavior**: Both `process_mcmicro_batch()` and `segment_mcmicro_batch()` skip already processed experiments by default. Use `overwrite=True` to recompute.
+
 ## What gets excluded by default
 
 DAPI, autofluorescence channels, empty channels, and a few other common non-markers are excluded from the weight sliders by default. You probably don't want these in your membrane composite anyway. Override with `exclude_channels=[]` if you need them.
@@ -158,12 +245,44 @@ DAPI, autofluorescence channels, empty channels, and a few other common non-mark
 │   ├── io.py               # TIFF/OME-TIFF loading
 │   ├── widgets.py          # Interactive Jupyter widget
 │   ├── segmentation.py     # Cellpose wrapper (optional)
-│   ├── batch.py            # Batch processing
-│   └── config.py           # Config save/load
+│   ├── batch.py            # Batch processing & segmentation
+│   ├── config.py           # Config save/load
+│   └── preview.py          # Image downsampling for previews
 ├── notebooks/
 │   └── pseudochannel_explorer.ipynb
 ├── configs/                # Your saved weight configs
 └── outputs/                # Generated pseudochannels
+```
+
+## API Reference
+
+### Core functions
+
+```python
+from pseudochannel import (
+    # I/O
+    load_channel_folder,      # Load folder of individual TIFFs
+    load_ome_tiff,            # Load OME-TIFF with marker file
+    OMETiffChannels,          # Lazy-loading OME-TIFF wrapper
+
+    # Processing
+    compute_pseudochannel,    # Compute weighted pseudochannel
+
+    # Config
+    save_config,              # Save weights to YAML
+    load_config,              # Load weights from YAML
+
+    # Batch processing
+    process_mcmicro_batch,    # Generate pseudochannels for MCMICRO experiments
+    segment_mcmicro_batch,    # Segment MCMICRO experiments with Cellpose
+    process_and_segment_mcmicro_batch,  # Both in one call
+
+    # Segmentation
+    CellposeConfig,           # Cellpose parameters dataclass
+    SegmentationResult,       # Full segmentation output (masks, flows, etc.)
+    run_segmentation,         # Run Cellpose, return masks only
+    run_segmentation_full,    # Run Cellpose, return full results
+)
 ```
 
 ## Tips

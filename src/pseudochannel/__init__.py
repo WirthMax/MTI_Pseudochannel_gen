@@ -22,8 +22,20 @@ from .io import (
 from .core import compute_pseudochannel
 from .preview import create_preview_stack, downsample_image
 from .config import save_config, load_config
-from .segmentation import CellposeConfig, run_segmentation, extract_mask_contours
-from .batch import process_dataset, find_mcmicro_experiments, process_mcmicro_batch
+from .segmentation import (
+    CellposeConfig,
+    SegmentationResult,
+    run_segmentation,
+    run_segmentation_full,
+    extract_mask_contours,
+)
+from .batch import (
+    process_dataset,
+    find_mcmicro_experiments,
+    process_mcmicro_batch,
+    segment_mcmicro_batch,
+    process_and_segment_mcmicro_batch,
+)
 
 __version__ = "0.1.0"
 
@@ -44,9 +56,13 @@ __all__ = [
     "save_config",
     "load_config",
     "CellposeConfig",
+    "SegmentationResult",
     "run_segmentation",
+    "run_segmentation_full",
     "extract_mask_contours",
     "process_dataset",
     "find_mcmicro_experiments",
     "process_mcmicro_batch",
+    "segment_mcmicro_batch",
+    "process_and_segment_mcmicro_batch",
 ]
