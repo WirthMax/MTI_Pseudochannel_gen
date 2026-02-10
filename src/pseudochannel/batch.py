@@ -501,6 +501,7 @@ def process_mcmicro_batch(
     chunk_size: int = 1024,
     output_dtype: str = "uint16",
     progress: bool = True,
+    overwrite: bool = False,
 ) -> list[Path]:
     """Batch process MCMICRO experiment folders.
 
@@ -513,9 +514,9 @@ def process_mcmicro_batch(
         ├── EXP_.../
         │   └── 1/
         │       └── rack-.../
+        │           ├── markers.csv
         │           ├── background/
-        │           │   ├── image.ome.tiff
-        │           │   └── markers.csv
+        │           │   └── image.ome.tiff
         │           └── pseudochannel/  <- output created here
         ├── EXP_.../
         │   └── ...
@@ -532,6 +533,8 @@ def process_mcmicro_batch(
         chunk_size: Chunk size for chunked processing
         output_dtype: Output data type ("uint16" or "float32")
         progress: Show progress bar
+        overwrite: If False (default), skip experiments that already have output.
+            If True, recompute all experiments.
 
     Returns:
         List of paths to saved output files
@@ -551,7 +554,25 @@ def process_mcmicro_batch(
         print(f"  (looking for '{background_folder}/' folders with '{marker_filename}' and a TIFF image)")
         return []
 
-    print(f"Found {len(experiments)} MCMICRO experiments to process:")
+    # Filter out already processed experiments unless overwrite=True
+    if not overwrite:
+        to_process = []
+        skipped = 0
+        for exp_info in experiments:
+            output_path = exp_info["background_path"].parent / output_folder / output_filename
+            if output_path.exists():
+                skipped += 1
+            else:
+                to_process.append(exp_info)
+        experiments = to_process
+        if skipped > 0:
+            print(f"Skipping {skipped} already processed experiments (use overwrite=True to recompute)")
+
+    if not experiments:
+        print("All experiments already processed.")
+        return []
+
+    print(f"Processing {len(experiments)} experiments:")
     for exp in experiments[:5]:
         print(f"  {exp['experiment_path'].name} -> {exp['background_path'].parent.name}/{background_folder}/")
     if len(experiments) > 5:
