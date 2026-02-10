@@ -745,3 +745,141 @@ class OMETiffChannels:
     def __del__(self):
         """Cleanup on deletion."""
         self.close()
+
+
+def save_cellpose_image(
+    nuclear: np.ndarray,
+    membrane: np.ndarray,
+    output_path: Union[str, Path],
+    output_dtype: str = "uint16",
+) -> Path:
+    """Save 2-channel Cellpose-compatible image.
+
+    Creates a multi-page TIFF with format (2, H, W) where:
+    - Page 0 (Channel 0): Nuclear marker
+    - Page 1 (Channel 1): Membrane/cytoplasm pseudochannel
+
+    For Cellpose segmentation, use channels=[2, 1] which maps:
+    - cyto channel = image channel 2 (our membrane, page 1)
+    - nucleus channel = image channel 1 (our nuclear, page 0)
+
+    Args:
+        nuclear: 2D array with nuclear marker (e.g., DAPI)
+        membrane: 2D array with membrane/cytoplasm pseudochannel
+        output_path: Path for output TIFF file
+        output_dtype: Output data type ("uint16" or "float32")
+
+    Returns:
+        Path to saved output file
+
+    Raises:
+        ValueError: If arrays have different shapes or unexpected dimensions
+    """
+    if nuclear.shape != membrane.shape:
+        raise ValueError(
+            f"Shape mismatch: nuclear {nuclear.shape} vs membrane {membrane.shape}"
+        )
+
+    if nuclear.ndim != 2:
+        raise ValueError(f"Expected 2D arrays, got nuclear with {nuclear.ndim} dimensions")
+
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # Normalize both channels to [0, 1] range if not already
+    def normalize_channel(arr: np.ndarray) -> np.ndarray:
+        arr = arr.astype(np.float32)
+        vmin, vmax = np.percentile(arr, [1, 99])
+        if vmax > vmin:
+            return np.clip((arr - vmin) / (vmax - vmin), 0, 1)
+        return np.zeros_like(arr)
+
+    # Check if already normalized
+    nuclear_norm = nuclear if (nuclear.min() >= 0 and nuclear.max() <= 1) else normalize_channel(nuclear)
+    membrane_norm = membrane if (membrane.min() >= 0 and membrane.max() <= 1) else normalize_channel(membrane)
+
+    # Convert to output dtype
+    if output_dtype == "uint16":
+        nuclear_out = (nuclear_norm * 65535).astype(np.uint16)
+        membrane_out = (membrane_norm * 65535).astype(np.uint16)
+    elif output_dtype == "uint8":
+        nuclear_out = (nuclear_norm * 255).astype(np.uint8)
+        membrane_out = (membrane_norm * 255).astype(np.uint8)
+    else:
+        nuclear_out = nuclear_norm.astype(np.float32)
+        membrane_out = membrane_norm.astype(np.float32)
+
+    # Stack as (2, H, W) for multi-page TIFF
+    stacked = np.stack([nuclear_out, membrane_out], axis=0)
+
+    tifffile.imwrite(str(output_path), stacked)
+
+    return output_path
+
+
+def add_nuclear_to_pseudochannel(
+    pseudochannel_path: Union[str, Path],
+    nuclear_path: Union[str, Path],
+    output_path: Optional[Union[str, Path]] = None,
+    output_dtype: str = "uint16",
+) -> Path:
+    """Combine existing single-channel pseudochannel with nuclear marker.
+
+    Loads a membrane/cytoplasm pseudochannel and a nuclear marker image,
+    then saves them as a 2-channel Cellpose-compatible TIFF.
+
+    Args:
+        pseudochannel_path: Path to single-channel pseudochannel TIFF
+        nuclear_path: Path to nuclear marker TIFF (e.g., DAPI)
+        output_path: Output path for combined image. If None, uses
+            {pseudochannel_stem}_2ch.tif in same directory
+        output_dtype: Output data type ("uint16" or "float32")
+
+    Returns:
+        Path to saved 2-channel output file
+    """
+    pseudochannel_path = Path(pseudochannel_path)
+    nuclear_path = Path(nuclear_path)
+
+    if not pseudochannel_path.exists():
+        raise FileNotFoundError(f"Pseudochannel file not found: {pseudochannel_path}")
+    if not nuclear_path.exists():
+        raise FileNotFoundError(f"Nuclear file not found: {nuclear_path}")
+
+    # Determine output path
+    if output_path is None:
+        output_path = pseudochannel_path.parent / f"{pseudochannel_path.stem}_2ch.tif"
+    else:
+        output_path = Path(output_path)
+
+    # Load images
+    membrane = tifffile.imread(str(pseudochannel_path))
+    nuclear = tifffile.imread(str(nuclear_path))
+
+    # Handle multi-dimensional arrays (take first slice if needed)
+    if membrane.ndim > 2:
+        membrane = membrane[0] if membrane.ndim == 3 else membrane[0, 0]
+    if nuclear.ndim > 2:
+        nuclear = nuclear[0] if nuclear.ndim == 3 else nuclear[0, 0]
+
+    # Normalize to [0, 1]
+    def to_float_normalized(arr: np.ndarray) -> np.ndarray:
+        arr = arr.astype(np.float32)
+        if arr.dtype == np.uint16 or arr.max() > 255:
+            arr = arr / 65535.0
+        elif arr.dtype == np.uint8 or arr.max() > 1:
+            arr = arr / 255.0
+        # Apply percentile normalization for nuclear
+        return arr
+
+    membrane_norm = to_float_normalized(membrane)
+
+    # Nuclear gets percentile normalization
+    nuclear_float = nuclear.astype(np.float32)
+    vmin, vmax = np.percentile(nuclear_float, [1, 99])
+    if vmax > vmin:
+        nuclear_norm = np.clip((nuclear_float - vmin) / (vmax - vmin), 0, 1)
+    else:
+        nuclear_norm = np.zeros_like(nuclear_float)
+
+    return save_cellpose_image(nuclear_norm, membrane_norm, output_path, output_dtype)

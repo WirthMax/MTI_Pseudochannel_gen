@@ -12,9 +12,20 @@ try:
 except ImportError:
     tqdm = None
 
+try:
+    from cellpose import io as cellpose_io
+except ImportError:
+    cellpose_io = None
+
 from .config import get_normalization_from_config, get_weights_from_config, load_config
 from .core import compute_pseudochannel, compute_pseudochannel_chunked
-from .io import load_channel_folder, load_ome_tiff, OMETiffChannels, validate_channels
+from .io import (
+    load_channel_folder,
+    load_ome_tiff,
+    OMETiffChannels,
+    validate_channels,
+    save_cellpose_image,
+)
 from .segmentation import (
     CellposeConfig,
     SegmentationResult,
@@ -433,6 +444,7 @@ def process_mcmicro_experiment(
     use_chunked: bool = True,
     chunk_size: int = 1024,
     output_dtype: str = "uint16",
+    include_nuclear: bool = False,
 ) -> Path:
     """Process a single MCMICRO experiment.
 
@@ -446,6 +458,7 @@ def process_mcmicro_experiment(
         use_chunked: Use chunked processing for memory efficiency
         chunk_size: Chunk size for chunked processing
         output_dtype: Output data type ("uint16" or "float32")
+        include_nuclear: If True, output 2-channel TIFF (nuclear + membrane)
 
     Returns:
         Path to saved output file
@@ -483,12 +496,41 @@ def process_mcmicro_experiment(
     output_dir.mkdir(parents=True, exist_ok=True)
     output_path = output_dir / output_filename
 
-    if output_dtype == "uint16":
-        output_data = (result * 65535).astype(np.uint16)
-    else:
-        output_data = result
+    if include_nuclear:
+        # Find and load nuclear marker
+        marker_names = channels._all_marker_names
+        nuclear_idx = find_nuclear_marker_index(marker_names)
 
-    tifffile.imwrite(str(output_path), output_data)
+        if nuclear_idx is not None:
+            nuclear_raw = channels.get_channel_by_index(nuclear_idx)
+            # Normalize nuclear marker using 1st/99th percentile
+            nuclear = nuclear_raw.astype(np.float32)
+            vmin, vmax = np.percentile(nuclear, [1, 99])
+            if vmax > vmin:
+                nuclear = np.clip((nuclear - vmin) / (vmax - vmin), 0, 1)
+            else:
+                nuclear = np.zeros_like(nuclear)
+
+            # Save 2-channel image
+            save_cellpose_image(nuclear, result, output_path, output_dtype)
+        else:
+            warnings.warn(
+                f"No nuclear marker found in {marker_path.name}, "
+                "saving single-channel pseudochannel instead"
+            )
+            # Fallback to single channel
+            if output_dtype == "uint16":
+                output_data = (result * 65535).astype(np.uint16)
+            else:
+                output_data = result
+            tifffile.imwrite(str(output_path), output_data)
+    else:
+        # Single channel output
+        if output_dtype == "uint16":
+            output_data = (result * 65535).astype(np.uint16)
+        else:
+            output_data = result
+        tifffile.imwrite(str(output_path), output_data)
 
     # Close the OMETiffChannels to release file handle
     channels.close()
@@ -507,6 +549,7 @@ def process_mcmicro_batch(
     use_chunked: bool = True,
     chunk_size: int = 1024,
     output_dtype: str = "uint16",
+    include_nuclear: bool = False,
     progress: bool = True,
     overwrite: bool = False,
 ) -> list[Path]:
@@ -539,6 +582,7 @@ def process_mcmicro_batch(
         use_chunked: Use chunked processing for memory efficiency
         chunk_size: Chunk size for chunked processing
         output_dtype: Output data type ("uint16" or "float32")
+        include_nuclear: If True, output 2-channel pseudochannel (nuclear + membrane).
         progress: Show progress bar
         overwrite: If False (default), skip experiments that already have output.
             If True, recompute all experiments.
@@ -604,6 +648,7 @@ def process_mcmicro_batch(
                 use_chunked=use_chunked,
                 chunk_size=chunk_size,
                 output_dtype=output_dtype,
+                include_nuclear=include_nuclear,
             )
             outputs.append(result_path)
 
@@ -652,7 +697,7 @@ def segment_mcmicro_experiment(
     pseudochannel_filename: str = "pseudochannel.tif",
     segmentation_folder: str = "segmentation",
     mask_filename: str = "seg_mask.tif",
-    flows_filename: str = "seg_flows.npy",
+    seg_npy_basename: str = "cellpose",
     mcmicro_markers: bool = True,
 ) -> tuple[Optional[Path], Optional[Path]]:
     """Segment a single MCMICRO experiment.
@@ -668,11 +713,11 @@ def segment_mcmicro_experiment(
         pseudochannel_filename: Filename of pseudochannel image.
         segmentation_folder: Output subfolder for segmentation results.
         mask_filename: Output filename for segmentation mask.
-        flows_filename: Output filename for Cellpose flows.
+        seg_npy_basename: Basename for Cellpose _seg.npy file (creates {basename}_seg.npy).
         mcmicro_markers: Use MCMICRO marker format for loading channels.
 
     Returns:
-        Tuple of (mask_path, flows_path), or (None, None) on error.
+        Tuple of (mask_path, seg_npy_path), or (None, None) on error.
     """
     background_path = experiment_info["background_path"]
     image_path = experiment_info["image_path"]
@@ -688,44 +733,71 @@ def segment_mcmicro_experiment(
 
     # Load pseudochannel (convert to float32 [0, 1])
     pseudo_data = tifffile.imread(str(pseudo_path))
-    if pseudo_data.dtype == np.uint16:
-        pseudochannel = pseudo_data.astype(np.float32) / 65535.0
-    elif pseudo_data.dtype == np.uint8:
-        pseudochannel = pseudo_data.astype(np.float32) / 255.0
-    else:
-        pseudochannel = pseudo_data.astype(np.float32)
-        # Normalize if not already in [0, 1]
-        if pseudochannel.max() > 1.0:
-            pseudochannel = pseudochannel / pseudochannel.max()
 
-    # Load nuclear marker from OME-TIFF
-    nuclear = None
-    try:
-        channels = OMETiffChannels(
-            image_path,
-            marker_path,
-            mcmicro_markers=mcmicro_markers,
-        )
-        marker_names = channels._all_marker_names
-        nuclear_idx = find_nuclear_marker_index(marker_names)
+    # Handle 2-channel pseudochannel (nuclear + membrane)
+    if pseudo_data.ndim == 3 and pseudo_data.shape[0] == 2:
+        # 2-channel format: (2, H, W) with nuclear=ch0, membrane=ch1
+        nuclear_data = pseudo_data[0]
+        membrane_data = pseudo_data[1]
 
-        if nuclear_idx is not None:
-            nuclear_raw = channels.get_channel_by_index(nuclear_idx)
-            # Normalize nuclear marker
-            nuclear = nuclear_raw.astype(np.float32)
-            vmin, vmax = np.percentile(nuclear, [1, 99])
-            if vmax > vmin:
-                nuclear = np.clip((nuclear - vmin) / (vmax - vmin), 0, 1)
-            else:
-                nuclear = np.zeros_like(nuclear)
+        # Normalize membrane
+        if membrane_data.dtype == np.uint16:
+            pseudochannel = membrane_data.astype(np.float32) / 65535.0
+        elif membrane_data.dtype == np.uint8:
+            pseudochannel = membrane_data.astype(np.float32) / 255.0
         else:
-            warnings.warn(
-                f"No nuclear marker found in {marker_path.name}, "
-                "proceeding with grayscale segmentation"
+            pseudochannel = membrane_data.astype(np.float32)
+            if pseudochannel.max() > 1.0:
+                pseudochannel = pseudochannel / pseudochannel.max()
+
+        # Normalize nuclear
+        if nuclear_data.dtype == np.uint16:
+            nuclear = nuclear_data.astype(np.float32) / 65535.0
+        elif nuclear_data.dtype == np.uint8:
+            nuclear = nuclear_data.astype(np.float32) / 255.0
+        else:
+            nuclear = nuclear_data.astype(np.float32)
+            if nuclear.max() > 1.0:
+                nuclear = nuclear / nuclear.max()
+    else:
+        # Single-channel pseudochannel
+        if pseudo_data.dtype == np.uint16:
+            pseudochannel = pseudo_data.astype(np.float32) / 65535.0
+        elif pseudo_data.dtype == np.uint8:
+            pseudochannel = pseudo_data.astype(np.float32) / 255.0
+        else:
+            pseudochannel = pseudo_data.astype(np.float32)
+            if pseudochannel.max() > 1.0:
+                pseudochannel = pseudochannel / pseudochannel.max()
+
+        # Load nuclear marker from OME-TIFF
+        nuclear = None
+        try:
+            channels = OMETiffChannels(
+                image_path,
+                marker_path,
+                mcmicro_markers=mcmicro_markers,
             )
-        channels.close()
-    except Exception as e:
-        warnings.warn(f"Error loading nuclear marker: {e}, proceeding with grayscale")
+            marker_names = channels._all_marker_names
+            nuclear_idx = find_nuclear_marker_index(marker_names)
+
+            if nuclear_idx is not None:
+                nuclear_raw = channels.get_channel_by_index(nuclear_idx)
+                # Normalize nuclear marker
+                nuclear = nuclear_raw.astype(np.float32)
+                vmin, vmax = np.percentile(nuclear, [1, 99])
+                if vmax > vmin:
+                    nuclear = np.clip((nuclear - vmin) / (vmax - vmin), 0, 1)
+                else:
+                    nuclear = np.zeros_like(nuclear)
+            else:
+                warnings.warn(
+                    f"No nuclear marker found in {marker_path.name}, "
+                    "proceeding with grayscale segmentation"
+                )
+            channels.close()
+        except Exception as e:
+            warnings.warn(f"Error loading nuclear marker: {e}, proceeding with grayscale")
 
     # Create model if not provided
     if model is None:
@@ -739,15 +811,41 @@ def segment_mcmicro_experiment(
     seg_dir.mkdir(parents=True, exist_ok=True)
 
     mask_path = seg_dir / mask_filename
-    flows_path = seg_dir / flows_filename
 
-    # Save mask as uint32 TIFF
+    # Save mask as uint32 TIFF (for easy loading without Cellpose)
     tifffile.imwrite(str(mask_path), result.masks.astype(np.uint32))
 
-    # Save flows as numpy archive (allow_pickle needed for reconstruction)
-    np.save(str(flows_path), result.flows, allow_pickle=True)
+    # Save using Cellpose native format (_seg.npy)
+    seg_npy_path = seg_dir / f"{seg_npy_basename}_seg.npy"
 
-    return (mask_path, flows_path)
+    if cellpose_io is not None:
+        # Build input image that was used for segmentation
+        if nuclear is not None:
+            input_image = np.stack([
+                (np.clip(pseudochannel, 0, 1) * 255).astype(np.uint8),
+                (np.clip(nuclear, 0, 1) * 255).astype(np.uint8),
+            ], axis=-1)  # (H, W, 2)
+        else:
+            input_image = (np.clip(pseudochannel, 0, 1) * 255).astype(np.uint8)
+
+        # Use Cellpose native save format
+        seg_base = str(seg_dir / seg_npy_basename)
+        cellpose_io.masks_flows_to_seg(
+            images=[input_image],
+            masks=[result.masks],
+            flows=[result.flows],
+            file_names=[seg_base],
+        )
+    else:
+        # Fallback: save as numpy dict if cellpose.io not available
+        seg_data = {
+            "masks": result.masks,
+            "flows": result.flows,
+            "img": (np.clip(pseudochannel, 0, 1) * 255).astype(np.uint8),
+        }
+        np.save(str(seg_npy_path), seg_data)
+
+    return (mask_path, seg_npy_path)
 
 
 def segment_mcmicro_batch(
@@ -759,7 +857,7 @@ def segment_mcmicro_batch(
     pseudochannel_filename: str = "pseudochannel.tif",
     segmentation_folder: str = "segmentation",
     mask_filename: str = "seg_mask.tif",
-    flows_filename: str = "seg_flows.npy",
+    seg_npy_basename: str = "cellpose",
     mcmicro_markers: bool = True,
     progress: bool = True,
     overwrite: bool = False,
@@ -782,13 +880,13 @@ def segment_mcmicro_batch(
         pseudochannel_filename: Filename of pseudochannel image.
         segmentation_folder: Output subfolder for segmentation results.
         mask_filename: Output filename for segmentation mask.
-        flows_filename: Output filename for Cellpose flows.
+        seg_npy_basename: Basename for Cellpose _seg.npy file (creates {basename}_seg.npy).
         mcmicro_markers: Use MCMICRO marker format.
         progress: Show progress bar.
         overwrite: If False (default), skip already segmented experiments.
 
     Returns:
-        List of (mask_path, flows_path) tuples for successfully segmented
+        List of (mask_path, seg_npy_path) tuples for successfully segmented
         experiments.
     """
     # Parse config
@@ -875,7 +973,7 @@ def segment_mcmicro_batch(
 
     for exp_info in iterator:
         try:
-            mask_path, flows_path = segment_mcmicro_experiment(
+            mask_path, seg_npy_path = segment_mcmicro_experiment(
                 exp_info,
                 cellpose_config,
                 model=model,
@@ -883,11 +981,11 @@ def segment_mcmicro_batch(
                 pseudochannel_filename=pseudochannel_filename,
                 segmentation_folder=segmentation_folder,
                 mask_filename=mask_filename,
-                flows_filename=flows_filename,
+                seg_npy_basename=seg_npy_basename,
                 mcmicro_markers=mcmicro_markers,
             )
             if mask_path is not None:
-                outputs.append((mask_path, flows_path))
+                outputs.append((mask_path, seg_npy_path))
         except Exception as e:
             exp_name = exp_info["experiment_path"].name
             print(f"Error segmenting {exp_name}: {e}")
@@ -906,8 +1004,9 @@ def process_and_segment_mcmicro_batch(
     pseudochannel_filename: str = "pseudochannel.tif",
     segmentation_folder: str = "segmentation",
     mask_filename: str = "seg_mask.tif",
-    flows_filename: str = "seg_flows.npy",
+    seg_npy_basename: str = "cellpose",
     mcmicro_markers: bool = True,
+    include_nuclear: bool = False,
     progress: bool = True,
     overwrite_pseudochannel: bool = False,
     overwrite_segmentation: bool = False,
@@ -928,8 +1027,9 @@ def process_and_segment_mcmicro_batch(
         pseudochannel_filename: Filename for pseudochannel image.
         segmentation_folder: Subfolder for segmentation outputs.
         mask_filename: Output filename for segmentation mask.
-        flows_filename: Output filename for Cellpose flows.
+        seg_npy_basename: Basename for Cellpose _seg.npy file.
         mcmicro_markers: Use MCMICRO marker format.
+        include_nuclear: If True, output 2-channel pseudochannel (nuclear + membrane).
         progress: Show progress bar.
         overwrite_pseudochannel: Overwrite existing pseudochannel images.
         overwrite_segmentation: Overwrite existing segmentation results.
@@ -937,7 +1037,7 @@ def process_and_segment_mcmicro_batch(
     Returns:
         Tuple of (pseudochannel_paths, segmentation_paths) where:
         - pseudochannel_paths: List of paths to generated pseudochannel images
-        - segmentation_paths: List of (mask_path, flows_path) tuples
+        - segmentation_paths: List of (mask_path, seg_npy_path) tuples
     """
     # Generate pseudochannels
     pseudo_paths = process_mcmicro_batch(
@@ -948,6 +1048,7 @@ def process_and_segment_mcmicro_batch(
         output_folder=pseudochannel_folder,
         output_filename=pseudochannel_filename,
         mcmicro_markers=mcmicro_markers,
+        include_nuclear=include_nuclear,
         progress=progress,
         overwrite=overwrite_pseudochannel,
     )
@@ -966,7 +1067,7 @@ def process_and_segment_mcmicro_batch(
         pseudochannel_filename=pseudochannel_filename,
         segmentation_folder=segmentation_folder,
         mask_filename=mask_filename,
-        flows_filename=flows_filename,
+        seg_npy_basename=seg_npy_basename,
         mcmicro_markers=mcmicro_markers,
         progress=progress,
         overwrite=overwrite_segmentation,

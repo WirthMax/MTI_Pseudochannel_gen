@@ -218,6 +218,61 @@ pseudo_paths, seg_paths = process_and_segment_mcmicro_batch(
 | Direct | `config=CellposeConfig(diameter=30, flow_threshold=0.4)` |
 | Defaults | `config=None` (auto GPU, cyto3 model) |
 
+#### CellposeConfig Parameters
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `model_type` | str | `"cyto3"` | Cellpose model to use. Options: `"cyto3"` (latest cytoplasm), `"cyto2"`, `"cyto"`, `"nuclei"` |
+| `diameter` | float \| None | `None` | Expected cell diameter in pixels. `None` = auto-estimate from image |
+| `flow_threshold` | float | `0.4` | Flow error threshold. Lower = stricter matching, fewer fragmented cells (range: 0-1) |
+| `cellprob_threshold` | float | `0.0` | Cell probability threshold. Higher = fewer cells, only high-confidence detections (range: -6 to 6) |
+| `gpu` | bool \| None | `None` | Use GPU acceleration. `None` = auto-detect CUDA availability |
+| `min_size` | int | `15` | Minimum cell size in pixels. Cells smaller than this are removed |
+
+**Example: Create config programmatically**
+```python
+from pseudochannel import CellposeConfig
+
+config = CellposeConfig(
+    model_type="cyto3",
+    diameter=35,              # Set if you know your cell size
+    flow_threshold=0.4,       # Lower for cleaner boundaries
+    cellprob_threshold=0.0,   # Raise to reduce false positives
+    min_size=15,
+)
+```
+
+**Example: YAML config with cellpose section**
+
+You can add a `cellpose` section to your weights YAML file. When you pass this file to `segment_mcmicro_batch()`, the cellpose parameters are extracted automatically:
+
+```yaml
+# configs/membrane_weights.yaml
+name: membrane
+description: CD45 + CD3 blend for immune cell boundaries
+
+weights:
+  CD45: 0.3
+  CD3: 0.2
+  CD8: 0.15
+  pan-CK: 0.25
+
+cellpose:
+  model_type: cyto3
+  diameter: 35
+  flow_threshold: 0.4
+  cellprob_threshold: 0.0
+  min_size: 15
+```
+
+```python
+# Both pseudochannel weights AND cellpose config come from the same file
+seg_outputs = segment_mcmicro_batch(
+    root_path="/data/CRC/",
+    config="configs/membrane_weights.yaml",
+)
+```
+
 Output structure after segmentation:
 ```
 experiment/
@@ -228,7 +283,7 @@ experiment/
 │   └── pseudochannel.tif
 └── segmentation/            <- Created
     ├── seg_mask.tif        <- uint32 label mask
-    └── seg_flows.npy       <- Cellpose flows for reconstruction
+    └── seg_flows.pkl       <- Cellpose flows (pickle format)
 ```
 
 **Skip-existing behavior**: Both `process_mcmicro_batch()` and `segment_mcmicro_batch()` skip already processed experiments by default. Use `overwrite=True` to recompute.

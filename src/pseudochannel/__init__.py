@@ -18,6 +18,8 @@ from .io import (
     load_ome_tiff,
     OMETiffChannels,
     parse_channel_name,
+    save_cellpose_image,
+    add_nuclear_to_pseudochannel,
 )
 from .core import compute_pseudochannel
 from .preview import create_preview_stack, downsample_image
@@ -50,6 +52,8 @@ __all__ = [
     "load_ome_tiff",
     "OMETiffChannels",
     "parse_channel_name",
+    "save_cellpose_image",
+    "add_nuclear_to_pseudochannel",
     "compute_pseudochannel",
     "create_preview_stack",
     "downsample_image",
