@@ -288,6 +288,61 @@ experiment/
 
 **Skip-existing behavior**: Both `process_mcmicro_batch()` and `segment_mcmicro_batch()` skip already processed experiments by default. Use `overwrite=True` to recompute.
 
+## Tiled Segmentation for Large Images
+
+If your images are too large to segment in one pass (e.g., causing out-of-memory errors), use the tiling workflow to split images into overlapping tiles, segment each tile separately, and merge the results.
+
+### When to use tiling
+
+- Images larger than ~10,000 x 10,000 pixels
+- Running into GPU or system memory limits
+- Cellpose or other segmentation tools crash on large images
+
+### Workflow overview
+
+1. **Split** the pseudochannel image into overlapping tiles
+2. **Segment** each tile (Cellpose GUI, Python, or other tool)
+3. **Merge** the tile masks back together, deduplicating cells in overlap regions
+
+### Quick start
+
+Open `notebooks/tiled_segmentation.ipynb` and follow the steps.
+
+### Tile size recommendations
+
+| Image size | Recommended tile size | Overlap |
+|------------|----------------------|---------|
+| < 10k px   | No tiling needed     | -       |
+| 10k-20k px | 2048 px              | 200 px  |
+| 20k-50k px | 4096 px              | 300 px  |
+| > 50k px   | 4096-8192 px         | 400 px  |
+
+The overlap should be at least 2x the expected cell diameter to ensure cells at tile boundaries are properly detected and deduplicated.
+
+### Python API
+
+```python
+from tiling import (
+    compute_tile_grid,    # Plan tile layout
+    split_image,          # Split image into tiles
+    save_tile_info,       # Save tile metadata
+    load_tile_info,       # Load tile metadata
+    load_tile_masks,      # Load segmented tile masks
+    merge_tile_masks,     # Merge with deduplication
+)
+
+# Split image
+tiles, tile_infos = split_image(image, tile_size=2048, overlap=200, output_dir="tiles/")
+save_tile_info(tile_infos, "tiles/tile_info.json", image_shape=image.shape)
+
+# ... segment tiles externally ...
+
+# Merge masks
+tile_infos, metadata = load_tile_info("tiles/tile_info.json")
+tile_masks = load_tile_masks("tiles/", tile_infos)
+merged = merge_tile_masks(tile_masks, tile_infos, metadata['image_shape'])
+```
+
 ## What gets excluded by default
 
 DAPI, autofluorescence channels, empty channels, and a few other common non-markers are excluded from the weight sliders by default. You probably don't want these in your membrane composite anyway. Override with `exclude_channels=[]` if you need them.
@@ -295,16 +350,21 @@ DAPI, autofluorescence channels, empty channels, and a few other common non-mark
 ## Project structure
 
 ```
-├── src/pseudochannel/      # Main package
-│   ├── core.py             # Pseudochannel computation
-│   ├── io.py               # TIFF/OME-TIFF loading
-│   ├── widgets.py          # Interactive Jupyter widget
-│   ├── segmentation.py     # Cellpose wrapper (optional)
-│   ├── batch.py            # Batch processing & segmentation
-│   ├── config.py           # Config save/load
-│   └── preview.py          # Image downsampling for previews
+├── src/
+│   ├── pseudochannel/      # Main package
+│   │   ├── core.py         # Pseudochannel computation
+│   │   ├── io.py           # TIFF/OME-TIFF loading
+│   │   ├── widgets.py      # Interactive Jupyter widget
+│   │   ├── segmentation.py # Cellpose wrapper (optional)
+│   │   ├── batch.py        # Batch processing & segmentation
+│   │   ├── config.py       # Config save/load
+│   │   └── preview.py      # Image downsampling for previews
+│   └── tiling/             # Large image tiling utilities
+│       ├── split.py        # Split images into tiles
+│       └── merge.py        # Merge segmented tile masks
 ├── notebooks/
-│   └── pseudochannel_explorer.ipynb
+│   ├── pseudochannel_explorer.ipynb  # Interactive weight tuning
+│   └── tiled_segmentation.ipynb      # Large image tiling workflow
 ├── configs/                # Your saved weight configs
 └── outputs/                # Generated pseudochannels
 ```
@@ -337,6 +397,20 @@ from pseudochannel import (
     SegmentationResult,       # Full segmentation output (masks, flows, etc.)
     run_segmentation,         # Run Cellpose, return masks only
     run_segmentation_full,    # Run Cellpose, return full results
+)
+
+from tiling import (
+    # Splitting
+    TileInfo,                 # Tile metadata dataclass
+    compute_tile_grid,        # Calculate tile coordinates
+    split_image,              # Split and save tiles
+    save_tile_info,           # Save tile metadata to JSON
+    load_tile_info,           # Load tile metadata from JSON
+
+    # Merging
+    load_tile_masks,          # Load segmented tile masks
+    merge_tile_masks,         # Merge with cell deduplication
+    relabel_mask,             # Ensure consecutive labels 1..N
 )
 ```
 
