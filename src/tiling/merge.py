@@ -454,34 +454,86 @@ def match_cells_in_overlap(
     if not existing_labels or not new_labels:
         return [], list(new_labels)
 
-    # Convert to sorted lists for consistent indexing
-    existing_labels_list = sorted(existing_labels)
-    new_labels_list = sorted(new_labels)
+    # --- Sparse IoU: only compare label pairs that share pixels ---
+    # For each existing label, find which new labels overlap with it.
+    # This avoids the O(E*N) dense matrix when most pairs have IoU=0.
 
-    # Compute IoU matrix in batch (more efficient than per-pair)
-    iou_matrix = compute_iou_matrix(
-        existing_overlap, new_overlap,
-        existing_labels_list, new_labels_list
-    )
+    # Pre-compute areas for each label in the overlap region
+    existing_areas = {}
+    new_areas = {}
 
-    # Pre-compute centroids for fallback matching (batch computation)
-    # Only compute for cells that might need centroid fallback
-    existing_props = compute_cell_properties_batch(mask_existing, existing_labels_list)
-    new_props = compute_cell_properties_batch(mask_new_full, new_labels_list)
+    for label in existing_labels:
+        existing_areas[label] = int(np.sum(existing_overlap == label))
+    for label in new_labels:
+        new_areas[label] = int(np.sum(new_overlap == label))
 
+    # Build sparse candidate pairs: for each existing cell, find new cells
+    # that share at least one pixel in the overlap
+    candidates = {}  # existing_label -> {new_label: iou}
+    for existing_label in existing_labels:
+        ex_mask = existing_overlap == existing_label
+        # Which new labels overlap with this existing cell?
+        overlapping_new = set(np.unique(new_overlap[ex_mask]).tolist())
+        overlapping_new.discard(0)
+        overlapping_new &= new_labels  # Only labels actually in overlap
+
+        if not overlapping_new:
+            continue
+
+        pair_ious = {}
+        for new_label in overlapping_new:
+            nw_mask = new_overlap == new_label
+            intersection = int(np.sum(ex_mask & nw_mask))
+            union = existing_areas[existing_label] + new_areas[new_label] - intersection
+            if union > 0:
+                pair_ious[new_label] = intersection / union
+        if pair_ious:
+            candidates[existing_label] = pair_ious
+
+    # --- Centroid cache (lazy, computed from overlap region only) ---
+    centroid_cache_existing = {}
+    centroid_cache_new = {}
+
+    def _get_existing_centroid(label):
+        if label not in centroid_cache_existing:
+            ys, xs = np.where(existing_overlap == label)
+            if len(ys) > 0:
+                # Convert overlap-local to image coords
+                centroid_cache_existing[label] = (
+                    float(np.mean(ys)) + overlap_y_start,
+                    float(np.mean(xs)) + overlap_x_start,
+                )
+            else:
+                centroid_cache_existing[label] = None
+        return centroid_cache_existing[label]
+
+    def _get_new_centroid(label):
+        if label not in centroid_cache_new:
+            ys, xs = np.where(new_overlap == label)
+            if len(ys) > 0:
+                # Convert tile-overlap-local to image coords
+                centroid_cache_new[label] = (
+                    float(np.mean(ys)) + tile_overlap_y_start + tile_info.y_start,
+                    float(np.mean(xs)) + tile_overlap_x_start + tile_info.x_start,
+                )
+            else:
+                centroid_cache_new[label] = None
+        return centroid_cache_new[label]
+
+    # --- Greedy matching ---
     matches = []
     matched_new = set()
 
-    # Match cells using IoU matrix
-    for i, existing_label in enumerate(existing_labels_list):
+    for existing_label in existing_labels:
+        if existing_label not in candidates:
+            continue
+
         best_match = None
         best_score = -1.0
 
-        for j, new_label in enumerate(new_labels_list):
+        for new_label, iou in candidates[existing_label].items():
             if new_label in matched_new:
                 continue
-
-            iou = iou_matrix[i, j]
 
             # Primary match: IoU threshold met
             if iou >= iou_threshold:
@@ -493,18 +545,10 @@ def match_cells_in_overlap(
 
             # Fallback: Centroid distance match (requires minimal overlap)
             if iou >= min_iou_for_centroid_match:
-                # Use cached centroids
-                existing_centroid = existing_props.get(existing_label)
-                new_centroid = new_props.get(new_label)
+                centroid_existing = _get_existing_centroid(existing_label)
+                centroid_new = _get_new_centroid(new_label)
 
-                if existing_centroid is not None and new_centroid is not None:
-                    # Convert new centroid to image coordinates
-                    centroid_existing = existing_centroid.centroid
-                    centroid_new = (
-                        new_centroid.centroid[0] + tile_info.y_start,
-                        new_centroid.centroid[1] + tile_info.x_start,
-                    )
-
+                if centroid_existing is not None and centroid_new is not None:
                     distance = _euclidean_distance(centroid_existing, centroid_new)
 
                     if distance < max_centroid_distance:
@@ -517,7 +561,7 @@ def match_cells_in_overlap(
             matches.append((existing_label, best_match))
             matched_new.add(best_match)
 
-    unmatched_new = [label for label in new_labels_list if label not in matched_new]
+    unmatched_new = [label for label in new_labels if label not in matched_new]
 
     return matches, unmatched_new
 
