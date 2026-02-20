@@ -676,7 +676,23 @@ def merge_tile_masks(
         # Handle overlap regions - only place cells that were NOT matched
         # (matched cells already exist in merged from previous tile)
 
-        # Top overlap region (for cells that don't have matches)
+        # Top-left corner (where top and left overlaps meet)
+        # This region is skipped by both top and left placement below,
+        # so it must be handled separately.
+        if info.overlap_top > 0 and info.overlap_left > 0:
+            corner_region = tile_mask[:info.overlap_top, :info.overlap_left]
+            dest_y_start = info.y_start
+            dest_y_end = info.y_start + info.overlap_top
+            dest_x_start = info.x_start
+            dest_x_end = info.x_start + info.overlap_left
+
+            mapped_corner = apply_label_map_vectorized(corner_region, label_map)
+            current = merged[dest_y_start:dest_y_end, dest_x_start:dest_x_end]
+
+            place_mask = (mapped_corner > 0) & (current == 0)
+            current[place_mask] = mapped_corner[place_mask]
+
+        # Top overlap region (excludes top-left corner)
         if info.overlap_top > 0:
             top_region = tile_mask[:info.overlap_top, info.overlap_left:tile_core_x_end]
             dest_y_start = info.y_start
@@ -684,15 +700,13 @@ def merge_tile_masks(
             dest_x_start = core_x_start
             dest_x_end = core_x_end
 
-            # Map the entire top region at once
             mapped_top = apply_label_map_vectorized(top_region, label_map)
             current = merged[dest_y_start:dest_y_end, dest_x_start:dest_x_end]
 
-            # Only place where there's no existing cell
             place_mask = (mapped_top > 0) & (current == 0)
             current[place_mask] = mapped_top[place_mask]
 
-        # Left overlap region (for cells that don't have matches)
+        # Left overlap region (excludes top-left corner)
         if info.overlap_left > 0:
             left_region = tile_mask[tile_core_y_start:tile_core_y_end, :info.overlap_left]
             dest_y_start = core_y_start
@@ -700,11 +714,9 @@ def merge_tile_masks(
             dest_x_start = info.x_start
             dest_x_end = info.x_start + info.overlap_left
 
-            # Map the entire left region at once
             mapped_left = apply_label_map_vectorized(left_region, label_map)
             current = merged[dest_y_start:dest_y_end, dest_x_start:dest_x_end]
 
-            # Only place where there's no existing cell
             place_mask = (mapped_left > 0) & (current == 0)
             current[place_mask] = mapped_left[place_mask]
 
