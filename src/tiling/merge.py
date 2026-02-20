@@ -586,14 +586,17 @@ def merge_tile_masks(
 
         # Create mapping from old labels to new labels
         label_map = {}
+        matched_merged_labels = set()  # Track which merged labels came from matches
 
         # Handle overlaps with already-processed tiles
+        # Previous tiles placed their FULL area (including overlaps) into
+        # merged, so the overlap region has data to match against.
+
         # Check left overlap (with tile at col-1)
         if col > 0 and (row, col - 1) in tile_masks:
             overlap_width = info.overlap_left
 
             if overlap_width > 0:
-                # Overlap region in original image coordinates
                 overlap_x_start = info.x_start
                 overlap_x_end = info.x_start + overlap_width
                 overlap_y_start = info.y_start
@@ -601,8 +604,8 @@ def merge_tile_masks(
 
                 matches, unmatched = match_cells_in_overlap(
                     merged,
-                    tile_mask,  # Pass full tile mask
-                    info,       # Pass tile info for coordinate transforms
+                    tile_mask,
+                    info,
                     overlap_y_start,
                     overlap_y_end,
                     overlap_x_start,
@@ -612,16 +615,15 @@ def merge_tile_masks(
                     min_iou_for_centroid_match,
                 )
 
-                # For matched cells, reuse existing label
                 for existing_label, new_label in matches:
                     label_map[new_label] = existing_label
+                    matched_merged_labels.add(existing_label)
 
         # Check top overlap (with tile at row-1)
         if row > 0 and (row - 1, col) in tile_masks:
             overlap_height = info.overlap_top
 
             if overlap_height > 0:
-                # Overlap region in original image coordinates
                 overlap_y_start = info.y_start
                 overlap_y_end = info.y_start + overlap_height
                 overlap_x_start = info.x_start
@@ -629,8 +631,8 @@ def merge_tile_masks(
 
                 matches, unmatched = match_cells_in_overlap(
                     merged,
-                    tile_mask,  # Pass full tile mask
-                    info,       # Pass tile info for coordinate transforms
+                    tile_mask,
+                    info,
                     overlap_y_start,
                     overlap_y_end,
                     overlap_x_start,
@@ -640,10 +642,10 @@ def merge_tile_masks(
                     min_iou_for_centroid_match,
                 )
 
-                # For matched cells, reuse existing label
                 for existing_label, new_label in matches:
                     if new_label not in label_map:
                         label_map[new_label] = existing_label
+                        matched_merged_labels.add(existing_label)
 
         # Assign new labels to unmatched cells
         for label in tile_labels:
@@ -651,74 +653,55 @@ def merge_tile_masks(
                 label_map[label] = next_label
                 next_label += 1
 
-        # Apply this tile to the merged mask
-        # We need to be careful about overlap regions
-        # Place the core region directly
-        core_y_start = info.y_start + info.overlap_top
-        core_y_end = info.y_end - info.overlap_bottom if info.overlap_bottom > 0 else info.y_end
-        core_x_start = info.x_start + info.overlap_left
-        core_x_end = info.x_end - info.overlap_right if info.overlap_right > 0 else info.x_end
+        # --- Place the FULL tile into merged ---
+        # Map the entire tile mask using label_map
+        mapped_full = apply_label_map_vectorized(tile_mask, label_map)
 
+        # Get the destination view (tile's full footprint in merged)
+        dest = merged[info.y_start:info.y_end, info.x_start:info.x_end]
+
+        # Core bounds in tile-local coordinates
         tile_core_y_start = info.overlap_top
         tile_core_y_end = tile_mask.shape[0] - info.overlap_bottom if info.overlap_bottom > 0 else tile_mask.shape[0]
         tile_core_x_start = info.overlap_left
         tile_core_x_end = tile_mask.shape[1] - info.overlap_right if info.overlap_right > 0 else tile_mask.shape[1]
 
-        # Place core region using vectorized label mapping
-        core_region = tile_mask[
-            tile_core_y_start:tile_core_y_end,
-            tile_core_x_start:tile_core_x_end,
-        ]
-        mapped_core = apply_label_map_vectorized(core_region, label_map)
+        # 1) Core region: always overwrite (this tile owns it)
+        dest[tile_core_y_start:tile_core_y_end,
+             tile_core_x_start:tile_core_x_end] = \
+            mapped_full[tile_core_y_start:tile_core_y_end,
+                        tile_core_x_start:tile_core_x_end]
 
-        merged[core_y_start:core_y_end, core_x_start:core_x_end] = mapped_core
+        # 2) Overlap regions: place the full tile area outside core
+        #    - Matched cells → overwrite (unifies the cell across tiles)
+        #    - Unmatched new cells → fill only where merged is empty
+        #    - Existing cells from previous tiles → preserve
+        is_core = np.zeros(tile_mask.shape, dtype=bool)
+        is_core[tile_core_y_start:tile_core_y_end,
+                tile_core_x_start:tile_core_x_end] = True
 
-        # Handle overlap regions - only place cells that were NOT matched
-        # (matched cells already exist in merged from previous tile)
+        has_overlap_cell = ~is_core & (mapped_full > 0)
 
-        # Top-left corner (where top and left overlaps meet)
-        # This region is skipped by both top and left placement below,
-        # so it must be handled separately.
-        if info.overlap_top > 0 and info.overlap_left > 0:
-            corner_region = tile_mask[:info.overlap_top, :info.overlap_left]
-            dest_y_start = info.y_start
-            dest_y_end = info.y_start + info.overlap_top
-            dest_x_start = info.x_start
-            dest_x_end = info.x_start + info.overlap_left
+        if matched_merged_labels and np.any(has_overlap_cell):
+            # Build fast lookup for matched labels
+            max_lut = max(max(matched_merged_labels), int(mapped_full.max())) + 1
+            is_matched_lut = np.zeros(max_lut, dtype=bool)
+            for label in matched_merged_labels:
+                is_matched_lut[label] = True
 
-            mapped_corner = apply_label_map_vectorized(corner_region, label_map)
-            current = merged[dest_y_start:dest_y_end, dest_x_start:dest_x_end]
+            is_matched_pixel = is_matched_lut[np.clip(mapped_full, 0, max_lut - 1)] & has_overlap_cell
 
-            place_mask = (mapped_corner > 0) & (current == 0)
-            current[place_mask] = mapped_corner[place_mask]
+            # Matched cells: overwrite to unify across tile boundary
+            dest[is_matched_pixel] = mapped_full[is_matched_pixel]
 
-        # Top overlap region (excludes top-left corner)
-        if info.overlap_top > 0:
-            top_region = tile_mask[:info.overlap_top, info.overlap_left:tile_core_x_end]
-            dest_y_start = info.y_start
-            dest_y_end = info.y_start + info.overlap_top
-            dest_x_start = core_x_start
-            dest_x_end = core_x_end
-
-            mapped_top = apply_label_map_vectorized(top_region, label_map)
-            current = merged[dest_y_start:dest_y_end, dest_x_start:dest_x_end]
-
-            place_mask = (mapped_top > 0) & (current == 0)
-            current[place_mask] = mapped_top[place_mask]
-
-        # Left overlap region (excludes top-left corner)
-        if info.overlap_left > 0:
-            left_region = tile_mask[tile_core_y_start:tile_core_y_end, :info.overlap_left]
-            dest_y_start = core_y_start
-            dest_y_end = core_y_end
-            dest_x_start = info.x_start
-            dest_x_end = info.x_start + info.overlap_left
-
-            mapped_left = apply_label_map_vectorized(left_region, label_map)
-            current = merged[dest_y_start:dest_y_end, dest_x_start:dest_x_end]
-
-            place_mask = (mapped_left > 0) & (current == 0)
-            current[place_mask] = mapped_left[place_mask]
+            # New cells: fill only where empty
+            is_new_pixel = has_overlap_cell & ~is_matched_pixel
+            fill_mask = is_new_pixel & (dest == 0)
+            dest[fill_mask] = mapped_full[fill_mask]
+        elif np.any(has_overlap_cell):
+            # No matches — fill only where empty (e.g. first tile)
+            fill_mask = has_overlap_cell & (dest == 0)
+            dest[fill_mask] = mapped_full[fill_mask]
 
     # Relabel to consecutive integers
     merged = relabel_mask(merged)
