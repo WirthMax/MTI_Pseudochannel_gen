@@ -288,7 +288,9 @@ stage_roi() {
 run_mcmicro() {
     local staged_dir="$1"
     local roi_name="$2"
-    local output_report="${MCMICRO_OUTPUT_BASE}/${roi_name}_report.html"
+    local timestamp
+    timestamp=$(date +%Y%m%d_%H%M%S)
+    local output_report="${MCMICRO_OUTPUT_BASE}/${roi_name}_report_${timestamp}.html"
 
     if [ "$DRY_RUN" = true ]; then
         log_msg "  Would run MCMICRO for: $roi_name"
