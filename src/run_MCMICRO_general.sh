@@ -180,24 +180,15 @@ should_skip_3_scan2() {
 # Return the highest-exposure directory under base_dir, or base_dir itself.
 get_highest_exposure_dir() {
     local base_dir="$1"
-    local raw_dirs=()
-    local raw_dir
+    local highest_raw
 
-    while IFS= read -r -d '' raw_dir; do
-        raw_dirs+=( "$raw_dir" )
-    done < <(find "$base_dir" -type d -name raw -print0 2>/dev/null)
+    # Find last (highest) raw dir alphabetically — works in both bash and zsh
+    highest_raw=$(find "$base_dir" -type d -name raw 2>/dev/null | sort | tail -n 1)
 
-    if [ "${#raw_dirs[@]}" -eq 0 ]; then
+    if [ -z "$highest_raw" ]; then
         echo "$base_dir"
         return 0
     fi
-
-    IFS=$'\n' read -r -d '' -a sorted_raw_dirs < <(
-        printf '%s\0' "${raw_dirs[@]}" | sort -z && printf '\0'
-    ) || true
-
-    local last_index=$(( ${#sorted_raw_dirs[@]} - 1 ))
-    local highest_raw="${sorted_raw_dirs[$last_index]}"
 
     highest_raw="${highest_raw%/}"
     local parent_dir="${highest_raw%/*}"
@@ -309,14 +300,16 @@ run_mcmicro() {
     log_info "Running MCMICRO for: $roi_name"
     log_info "  Input: $staged_dir"
 
-    if nextflow run \
+    # Run nextflow from the output directory so .nextflow/ and .nextflow.log
+    # are created there instead of wherever the script was launched from.
+    if (cd "$MCMICRO_OUTPUT_BASE" && nextflow run \
         -c "$SINGULARITY_CONFIG" \
         labsyspharm/mcmicro \
         --in "$staged_dir" \
         -profile singularity \
         --params "$PARAMS_FILE" \
         -work-dir "$MCMICRO_WORK_DIR" \
-        -with-report "$output_report" >> "$LOG_FILE" 2>&1; then
+        -with-report "$output_report") >> "$LOG_FILE" 2>&1; then
         log_success "MCMICRO completed for $roi_name"
         log_info "  Report saved to: $output_report"
         return 0
