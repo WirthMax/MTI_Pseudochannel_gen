@@ -138,7 +138,7 @@ should_skip_experiment() {
 
     for skip_exp in "${SKIP_LIST[@]}"; do
         skip_exp=$(echo "$skip_exp" | xargs)
-        if [ "$exp_name" == "$skip_exp" ]; then
+        if [ "$exp_name" = "$skip_exp" ]; then
             return 0
         fi
     done
@@ -160,7 +160,7 @@ matches_experiment_filter() {
 should_skip_3_scan2() {
     local folder_name="$1"
 
-    if [ "$SKIP_3_SCAN2" = true ] && [ "$folder_name" == "3_Scan2" ]; then
+    if [ "$SKIP_3_SCAN2" = true ] && [ "$folder_name" = "3_Scan2" ]; then
         return 0
     fi
 
@@ -433,7 +433,7 @@ process_experiment() {
             local r_name
             r_name=$(basename "$r_folder")
 
-            if [ "$r_name" == "R0" ]; then
+            if [ "$r_name" = "R0" ]; then
                 log_msg "    Skipping: $r_name"
                 continue
             fi
@@ -453,7 +453,7 @@ process_experiment() {
                     local roi_name
                     roi_name=$(basename "$roi_folder")
 
-                    if [ "$roi_name" == "ROI0" ]; then
+                    if [ "$roi_name" = "ROI0" ]; then
                         log_msg "        Skipping: $roi_name"
                         continue
                     fi
