@@ -17,6 +17,8 @@ SKIP_3_SCAN2=true
 USE_HIGHEST_EXPOSURE=true
 REFERENCE_MARKER="DAPI"
 EXPERIMENT_FILTER=""
+CLEANUP_STAGED=false
+RECOMPUTE=false
 
 # Config paths (set via CLI flags or environment variables)
 ROOT_DIR="${MCMICRO_ROOT_DIR:-}"
@@ -152,6 +154,14 @@ matches_experiment_filter() {
         return 0  # No filter = match all
     fi
     if [[ "$exp_name" =~ $EXPERIMENT_FILTER ]]; then
+        return 0
+    fi
+    return 1
+}
+
+is_already_staged() {
+    local staged_dir="$1"
+    if [ -d "$staged_dir" ] && [ -n "$(ls -A "$staged_dir" 2>/dev/null)" ]; then
         return 0
     fi
     return 1
@@ -374,13 +384,25 @@ process_roi() {
 
     log_msg "Processing ROI: $roi_name"
 
-    # Stage the ROI
-    if ! stage_roi "$roi_path" "$staged_dir" "$roi_name"; then
-        if [ "$DRY_RUN" = false ]; then
-            log_error "FAILED - Staging failed for $roi_name"
-            echo "$roi_name,STAGING_FAILED,$(date '+%Y-%m-%d %H:%M:%S')" >> "${LOG_FILE%.log}_summary.csv"
+    # Stage the ROI (skip if already staged, unless --recompute)
+    if is_already_staged "$staged_dir" && [ "$RECOMPUTE" = false ]; then
+        log_msg "  Staging already exists, skipping: $staged_dir"
+    else
+        if [ "$RECOMPUTE" = true ] && [ -d "$staged_dir" ]; then
+            if [ "$DRY_RUN" = true ]; then
+                log_msg "  Would remove existing staged dir for recompute: $staged_dir"
+            else
+                log_info "  Removing existing staged dir for recompute: $staged_dir"
+                rm -rf "$staged_dir"
+            fi
         fi
-        return 1
+        if ! stage_roi "$roi_path" "$staged_dir" "$roi_name"; then
+            if [ "$DRY_RUN" = false ]; then
+                log_error "FAILED - Staging failed for $roi_name"
+                echo "$roi_name,STAGING_FAILED,$(date '+%Y-%m-%d %H:%M:%S')" >> "${LOG_FILE%.log}_summary.csv"
+            fi
+            return 1
+        fi
     fi
 
     # Resolve the actual directory to feed into MCMICRO
@@ -402,6 +424,13 @@ process_roi() {
     if [ "$DRY_RUN" = false ]; then
         log_success "COMPLETED - Successfully processed $roi_name"
         echo "$roi_name,SUCCESS,$(date '+%Y-%m-%d %H:%M:%S')" >> "${LOG_FILE%.log}_summary.csv"
+        if [ "$CLEANUP_STAGED" = true ]; then
+            cleanup_staged "$staged_dir" "$roi_name"
+        fi
+    else
+        if [ "$CLEANUP_STAGED" = true ]; then
+            log_msg "  Would clean up staged data: $staged_dir/raw"
+        fi
     fi
     return 0
 }
@@ -506,6 +535,12 @@ print_config_summary() {
         log_msg "Using highest exposure only (-he for staging, highest folder for MCMICRO)"
     else
         log_msg "Using all exposures (MCMICRO still uses highest exposure folder if multiple exist)"
+    fi
+    if [ "$CLEANUP_STAGED" = true ]; then
+        log_msg "Cleanup staged data: YES (after successful processing)"
+    fi
+    if [ "$RECOMPUTE" = true ]; then
+        log_msg "Recompute mode:     YES (force re-stage and re-process)"
     fi
     echo ""
 
@@ -637,6 +672,14 @@ while [[ $# -gt 0 ]]; do
             USE_HIGHEST_EXPOSURE=true
             shift
             ;;
+        --cleanup-staged)
+            CLEANUP_STAGED=true
+            shift
+            ;;
+        --recompute)
+            RECOMPUTE=true
+            shift
+            ;;
         --help|-h)
             cat <<EOF
 MACSima Pipeline - Staging and MCMICRO Processing
@@ -666,6 +709,8 @@ Optional arguments:
   --skip-3-scan2              Skip all 3_Scan2 folders during processing
   --highest-exposure-only     Use only highest exposure in staging (-he flag)
   -he                         Same as --highest-exposure-only
+  --cleanup-staged            Delete staged raw data after successful processing
+  --recompute                 Force re-staging and re-processing (ignore existing data)
   --help, -h                  Show this help message
 
 Examples:
@@ -688,6 +733,12 @@ Examples:
 
   # Use a different nuclear marker
   $0 --reference-marker "Hoechst" ...
+
+  # Clean up staged data after each successful ROI
+  $0 --cleanup-staged ...
+
+  # Force full re-processing of all ROIs
+  $0 --recompute ...
 
   # Using environment variables
   export MCMICRO_ROOT_DIR=/data/CRC_study
