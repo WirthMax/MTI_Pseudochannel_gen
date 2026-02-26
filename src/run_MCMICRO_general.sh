@@ -16,6 +16,7 @@ SKIP_EXPERIMENTS=""
 SKIP_3_SCAN2=true
 USE_HIGHEST_EXPOSURE=true
 REFERENCE_MARKER="DAPI"
+EXPERIMENT_FILTER=""
 
 # Config paths (set via CLI flags or environment variables)
 ROOT_DIR="${MCMICRO_ROOT_DIR:-}"
@@ -142,6 +143,17 @@ should_skip_experiment() {
         fi
     done
 
+    return 1
+}
+
+matches_experiment_filter() {
+    local exp_name="$1"
+    if [ -z "$EXPERIMENT_FILTER" ]; then
+        return 0  # No filter = match all
+    fi
+    if [[ "$exp_name" =~ $EXPERIMENT_FILTER ]]; then
+        return 0
+    fi
     return 1
 }
 
@@ -484,6 +496,9 @@ print_config_summary() {
     if [ -n "$SKIP_EXPERIMENTS" ]; then
         log_msg "Skipping experiments: $SKIP_EXPERIMENTS"
     fi
+    if [ -n "$EXPERIMENT_FILTER" ]; then
+        log_msg "Experiment filter:  $EXPERIMENT_FILTER"
+    fi
     if [ "$SKIP_3_SCAN2" = true ]; then
         log_msg "Skipping 3_Scan2 folders: YES"
     fi
@@ -542,11 +557,17 @@ main() {
 
     print_config_summary
 
-    for exp_dir in "$ROOT_DIR"/EXP_*/; do
+    for exp_dir in "$ROOT_DIR"/*/; do
         [ -d "$exp_dir" ] || continue
 
         local exp_name
         exp_name=$(basename "$exp_dir")
+
+        if ! matches_experiment_filter "$exp_name"; then
+            log_msg "Skipping experiment: $exp_name (does not match filter)"
+            SKIPPED_EXPERIMENTS=$((SKIPPED_EXPERIMENTS + 1))
+            continue
+        fi
 
         if should_skip_experiment "$exp_name"; then
             log_msg "Skipping experiment: $exp_name (in skip list)"
@@ -604,6 +625,10 @@ while [[ $# -gt 0 ]]; do
             SKIP_EXPERIMENTS="$2"
             shift 2
             ;;
+        --experiment-filter)
+            EXPERIMENT_FILTER="$2"
+            shift 2
+            ;;
         --skip-3-scan2)
             SKIP_3_SCAN2=true
             shift
@@ -619,7 +644,7 @@ MACSima Pipeline - Staging and MCMICRO Processing
 Usage: $0 [OPTIONS]
 
 Required arguments (or set via environment variables):
-  --root-dir DIR              Root directory containing EXP_* folders
+  --root-dir DIR              Root directory containing experiment folders
                               (env: MCMICRO_ROOT_DIR)
   --container FILE            Path to macsima2mc Singularity container
                               (env: MCMICRO_STAGING_CONTAINER)
@@ -637,6 +662,7 @@ Optional arguments:
   --dry-run, -d               Run in dry-run mode (preview without executing)
   --skip-exp <list>           Skip specific experiments (comma-separated)
   --skip-experiments <list>   Same as --skip-exp
+  --experiment-filter REGEX   Only process experiments matching REGEX (bash regex)
   --skip-3-scan2              Skip all 3_Scan2 folders during processing
   --highest-exposure-only     Use only highest exposure in staging (-he flag)
   -he                         Same as --highest-exposure-only
@@ -656,6 +682,9 @@ Examples:
 
   # Skip specific experiments
   $0 --skip-exp EXP_001,EXP_003 ...
+
+  # Only process folders starting with EXP_
+  $0 --experiment-filter "^EXP_" ...
 
   # Use a different nuclear marker
   $0 --reference-marker "Hoechst" ...
