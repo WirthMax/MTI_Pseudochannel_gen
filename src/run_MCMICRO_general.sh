@@ -13,7 +13,7 @@ set -euo pipefail
 
 DRY_RUN=false
 SKIP_EXPERIMENTS=""
-SKIP_3_SCAN2=true
+USE_OVERVIEW_SCAN_DAPI=false
 USE_HIGHEST_EXPOSURE=true
 REFERENCE_MARKER="DAPI"
 EXPERIMENT_FILTER=""
@@ -167,14 +167,42 @@ is_already_staged() {
     return 1
 }
 
-should_skip_3_scan2() {
-    local folder_name="$1"
+inject_scan2_as_cycle0() {
+    local roi_path="$1"
+    local scan2_dir="${roi_path}/3_Scan2"
+    local cycle0_dir="${roi_path}/5_Cycle0"
 
-    if [ "$SKIP_3_SCAN2" = true ] && [ "$folder_name" = "3_Scan2" ]; then
+    if [ ! -d "$scan2_dir" ]; then
+        log_warning "3_Scan2 directory not found in $roi_path — skipping Cycle0 injection"
+        return 1
+    fi
+
+    if [ -d "$cycle0_dir" ]; then
+        log_info "5_Cycle0 already exists in $roi_path — skipping injection (idempotent)"
         return 0
     fi
 
-    return 1
+    mkdir -p "$cycle0_dir"
+
+    local file_count=0
+    for tif in "$scan2_dir"/*.tif; do
+        [ -f "$tif" ] || continue
+        cp "$tif" "$cycle0_dir/CYC-000_$(basename "$tif")"
+        file_count=$((file_count + 1))
+    done
+
+    log_info "Injected $file_count .tif files from 3_Scan2 as Cycle0 in $roi_path"
+    return 0
+}
+
+cleanup_cycle0() {
+    local roi_path="$1"
+    local cycle0_dir="${roi_path}/5_Cycle0"
+
+    if [ -d "$cycle0_dir" ]; then
+        rm -rf "$cycle0_dir"
+        log_info "Cleaned up injected Cycle0 directory: $cycle0_dir"
+    fi
 }
 
 # Return the highest-exposure directory under base_dir, or base_dir itself.
@@ -218,9 +246,6 @@ stage_roi() {
             local cycle_folder
             cycle_folder=$(basename "$cycle")
             log_msg "      Cycle: $cycle_folder"
-            if should_skip_3_scan2 "$cycle_folder"; then
-                log_msg "      (skipped - 3_Scan2)"
-            fi
         done
         return 0
     fi
@@ -239,11 +264,6 @@ stage_roi() {
 
         local cycle_folder
         cycle_folder=$(basename "$cycle")
-
-        if should_skip_3_scan2 "$cycle_folder"; then
-            log_info "  Skipping 3_Scan2 folder: $cycle_folder"
-            continue
-        fi
 
         cycle_count=$((cycle_count + 1))
         log_info "  Processing cycle: $cycle_folder"
@@ -391,6 +411,13 @@ process_roi() {
                 rm -rf "$staged_dir"
             fi
         fi
+        if [ "$USE_OVERVIEW_SCAN_DAPI" = true ]; then
+            if [ "$DRY_RUN" = true ]; then
+                log_msg "  Would inject 3_Scan2 as Cycle0"
+            else
+                inject_scan2_as_cycle0 "$roi_path"
+            fi
+        fi
         if ! stage_roi "$roi_path" "$staged_dir" "$roi_name"; then
             if [ "$DRY_RUN" = false ]; then
                 log_error "FAILED - Staging failed for $roi_name"
@@ -421,6 +448,9 @@ process_roi() {
         echo "$roi_name,SUCCESS,$(date '+%Y-%m-%d %H:%M:%S')" >> "${LOG_FILE%.log}_summary.csv"
         if [ "$CLEANUP_STAGED" = true ]; then
             cleanup_staged "$staged_dir" "$roi_name"
+        fi
+        if [ "$USE_OVERVIEW_SCAN_DAPI" = true ]; then
+            cleanup_cycle0 "$roi_path"
         fi
     else
         if [ "$CLEANUP_STAGED" = true ]; then
@@ -523,8 +553,8 @@ print_config_summary() {
     if [ -n "$EXPERIMENT_FILTER" ]; then
         log_msg "Experiment filter:  $EXPERIMENT_FILTER"
     fi
-    if [ "$SKIP_3_SCAN2" = true ]; then
-        log_msg "Skipping 3_Scan2 folders: YES"
+    if [ "$USE_OVERVIEW_SCAN_DAPI" = true ]; then
+        log_msg "Using 3_Scan2 DAPI as Cycle 0: YES"
     fi
     if [ "$USE_HIGHEST_EXPOSURE" = true ]; then
         log_msg "Using highest exposure only (-he for staging, highest folder for MCMICRO)"
@@ -659,8 +689,8 @@ while [[ $# -gt 0 ]]; do
             EXPERIMENT_FILTER="$2"
             shift 2
             ;;
-        --skip-3-scan2)
-            SKIP_3_SCAN2=true
+        --use-overview-scan-dapi)
+            USE_OVERVIEW_SCAN_DAPI=true
             shift
             ;;
         --highest-exposure-only|-he)
@@ -701,7 +731,7 @@ Optional arguments:
   --skip-exp <list>           Skip specific experiments (comma-separated)
   --skip-experiments <list>   Same as --skip-exp
   --experiment-filter REGEX   Only process experiments matching REGEX (bash regex)
-  --skip-3-scan2              Skip all 3_Scan2 folders during processing
+  --use-overview-scan-dapi    Use DAPI from 3_Scan2 as Cycle 0 (copies folder, renames files, cleans up on success)
   --highest-exposure-only     Use only highest exposure in staging (-he flag)
   -he                         Same as --highest-exposure-only
   --cleanup-staged            Delete staged raw data after successful processing
