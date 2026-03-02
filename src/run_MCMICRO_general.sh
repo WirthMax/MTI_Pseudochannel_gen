@@ -185,7 +185,7 @@ inject_scan2_as_cycle0() {
     mkdir -p "$cycle0_dir"
 
     local file_count=0
-    for tif in "$scan2_dir"/*.tif; do
+    for tif in "$scan2_dir"/*_D-DAPI_*.tif; do
         [ -f "$tif" ] || continue
         cp "$tif" "$cycle0_dir/CYC-000_$(basename "$tif")"
         file_count=$((file_count + 1))
