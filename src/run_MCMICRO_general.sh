@@ -177,11 +177,10 @@ inject_scan2_as_cycle0() {
         return 1
     fi
 
+    # Always recreate to ensure only DAPI tiles are present
     if [ -d "$cycle0_dir" ]; then
-        log_info "5_Cycle0 already exists in $roi_path — skipping injection (idempotent)"
-        return 0
+        rm -rf "$cycle0_dir"
     fi
-
     mkdir -p "$cycle0_dir"
 
     local file_count=0
