@@ -7,6 +7,11 @@
 
 set -euo pipefail
 
+# Prevent zsh from erroring on non-matching globs (match bash default behavior)
+if [ -n "${ZSH_VERSION:-}" ]; then
+    setopt NO_NOMATCH
+fi
+
 #==============================================================================
 # DEFAULTS
 #==============================================================================
@@ -139,10 +144,14 @@ should_skip_experiment() {
         return 1
     fi
 
-    IFS=',' read -ra SKIP_LIST <<< "$SKIP_EXPERIMENTS"
+    local SKIP_LIST=()
+    local _item
+    while IFS= read -r _item; do
+        _item=$(echo "$_item" | xargs)  # trim whitespace
+        [ -n "$_item" ] && SKIP_LIST+=("$_item")
+    done < <(echo "$SKIP_EXPERIMENTS" | tr ',' '\n')
 
     for skip_exp in "${SKIP_LIST[@]}"; do
-        skip_exp=$(echo "$skip_exp" | xargs)
         if [ "$exp_name" = "$skip_exp" ]; then
             return 0
         fi
@@ -202,7 +211,7 @@ swap_scan_dapi_into_cycle1() {
     local roi_id
     for f in "$scan_dir"/*_D-DAPI_*.tif; do
         [ -f "$f" ] || continue
-        roi_id=$(basename "$f" | grep -oP 'ROI-\d+')
+        roi_id=$(basename "$f" | grep -oE 'ROI-[0-9]+')
         if [ -n "$roi_id" ]; then
             local found=false
             for r in "${rois[@]+"${rois[@]}"}"; do
