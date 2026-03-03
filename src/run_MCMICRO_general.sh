@@ -244,15 +244,15 @@ swap_scan_dapi_into_cycle1() {
             return 1
         fi
 
-        for ((i=0; i<${#scan_dapis[@]}; i++)); do
-            local cycle1_file="${cycle1_dapis[$i]}"
-            local scan_file="${scan_dapis[$i]}"
+        while IFS=$'\t' read -r scan_file cycle1_file; do
             # Backup the original cycle1 DAPI
             cp "$cycle1_file" "$backup_dir/"
             # Overwrite cycle1 DAPI with scan DAPI (keep the cycle1 filename)
             cp "$scan_file" "$cycle1_file"
             total_swapped=$((total_swapped + 1))
-        done
+        done < <(paste \
+            <(printf '%s\n' "${scan_dapis[@]}") \
+            <(printf '%s\n' "${cycle1_dapis[@]}"))
     done
 
     log_info "Swapped $total_swapped scan DAPI tiles into Cycle1 in $roi_path (${#rois[@]} ROIs)"
