@@ -229,13 +229,13 @@ swap_scan_dapi_into_cycle1() {
         local scan_dapis=()
         while IFS= read -r f; do
             scan_dapis+=("$f")
-        done < <(find "$scan_dir" -name "*_${roi_id}_*_D-DAPI_*.tif" -type f | sort -t'F-' -k2 -n)
+        done < <(find "$scan_dir" -name "*_${roi_id}_*_D-DAPI_*.tif" -type f | sort -V)
 
         # Collect Cycle1 Stain DAPI files for this ROI, sorted by F-number
         local cycle1_dapis=()
         while IFS= read -r f; do
             cycle1_dapis+=("$f")
-        done < <(find "$cycle1_dir" -name "*_ST-S_*_${roi_id}_*_D-DAPI_*.tif" -type f | sort -t'F-' -k2 -n)
+        done < <(find "$cycle1_dir" -name "*_ST-S_*_${roi_id}_*_D-DAPI_*.tif" -type f | sort -V)
 
         if [ ${#scan_dapis[@]} -ne ${#cycle1_dapis[@]} ]; then
             log_error "DAPI count mismatch for $roi_id: ${#scan_dapis[@]} scan vs ${#cycle1_dapis[@]} cycle1 ST-S"
@@ -244,7 +244,7 @@ swap_scan_dapi_into_cycle1() {
             return 1
         fi
 
-        for i in "${!scan_dapis[@]}"; do
+        for ((i=0; i<${#scan_dapis[@]}; i++)); do
             local cycle1_file="${cycle1_dapis[$i]}"
             local scan_file="${scan_dapis[$i]}"
             # Backup the original cycle1 DAPI
