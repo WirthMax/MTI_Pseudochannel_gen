@@ -13,7 +13,7 @@ set -euo pipefail
 
 DRY_RUN=false
 SKIP_EXPERIMENTS=""
-USE_OVERVIEW_SCAN_DAPI=false
+USE_SCAN_DAPI=false
 USE_HIGHEST_EXPOSURE=true
 REFERENCE_MARKER="DAPI"
 EXPERIMENT_FILTER=""
@@ -167,41 +167,129 @@ is_already_staged() {
     return 1
 }
 
-inject_scan2_as_cycle0() {
+swap_scan_dapi_into_cycle1() {
     local roi_path="$1"
-    local scan2_dir="${roi_path}/3_Scan2"
-    local cycle0_dir="${roi_path}/5_Cycle0"
+    local scan_dir="${roi_path}/3_Scan2"
+    local backup_dir="${roi_path}/.dapi_backup"
 
-    if [ ! -d "$scan2_dir" ]; then
-        log_warning "3_Scan2 directory not found in $roi_path — skipping Cycle0 injection"
+    # Find the Cycle1 directory (e.g. 6_Cycle1)
+    local cycle1_dir
+    cycle1_dir=$(find "$roi_path" -maxdepth 1 -type d -name '*_Cycle1' | head -1)
+
+    if [ ! -d "$scan_dir" ]; then
+        log_warning "3_Scan2 directory not found in $roi_path — skipping DAPI swap"
         return 1
     fi
 
-    # Always recreate to ensure only DAPI tiles are present
-    if [ -d "$cycle0_dir" ]; then
-        rm -rf "$cycle0_dir"
+    if [ -z "$cycle1_dir" ]; then
+        log_warning "No *_Cycle1 directory found in $roi_path — skipping DAPI swap"
+        return 1
     fi
-    mkdir -p "$cycle0_dir"
 
-    local file_count=0
-    for tif in "$scan2_dir"/*_D-DAPI_*.tif; do
-        [ -f "$tif" ] || continue
-        cp "$tif" "$cycle0_dir/CYC-000_$(basename "$tif")"
-        file_count=$((file_count + 1))
+    # If backup already exists (interrupted previous run), restore first
+    if [ -d "$backup_dir" ]; then
+        log_warning "Found stale .dapi_backup in $roi_path — restoring before re-swapping"
+        restore_cycle1_dapi "$roi_path"
+    fi
+
+    # Clean up any stale Cycle0 directories from the old approach
+    for old_cycle0 in "${roi_path}"/*_Cycle0; do
+        if [ -d "$old_cycle0" ]; then
+            rm -rf "$old_cycle0"
+            log_info "Removed stale Cycle0 directory: $old_cycle0"
+        fi
     done
 
-    log_info "Injected $file_count .tif files from 3_Scan2 as Cycle0 in $roi_path"
+    mkdir -p "$backup_dir"
+
+    # Collect unique ROI identifiers from scan DAPI files
+    local rois=()
+    local roi_id
+    for f in "$scan_dir"/*_D-DAPI_*.tif; do
+        [ -f "$f" ] || continue
+        roi_id=$(basename "$f" | grep -oP 'ROI-\d+')
+        if [ -n "$roi_id" ]; then
+            local found=false
+            for r in "${rois[@]+"${rois[@]}"}"; do
+                if [ "$r" = "$roi_id" ]; then
+                    found=true
+                    break
+                fi
+            done
+            if [ "$found" = false ]; then
+                rois+=("$roi_id")
+            fi
+        fi
+    done
+
+    if [ ${#rois[@]} -eq 0 ]; then
+        log_warning "No DAPI files found in $scan_dir — skipping DAPI swap"
+        rmdir "$backup_dir" 2>/dev/null || true
+        return 1
+    fi
+
+    local total_swapped=0
+    for roi_id in "${rois[@]}"; do
+        # Collect scan DAPI files for this ROI, sorted by F-number
+        local scan_dapis=()
+        while IFS= read -r f; do
+            scan_dapis+=("$f")
+        done < <(find "$scan_dir" -name "*_${roi_id}_*_D-DAPI_*.tif" -type f | sort -t'F-' -k2 -n)
+
+        # Collect Cycle1 Stain DAPI files for this ROI, sorted by F-number
+        local cycle1_dapis=()
+        while IFS= read -r f; do
+            cycle1_dapis+=("$f")
+        done < <(find "$cycle1_dir" -name "*_ST-S_*_${roi_id}_*_D-DAPI_*.tif" -type f | sort -t'F-' -k2 -n)
+
+        if [ ${#scan_dapis[@]} -ne ${#cycle1_dapis[@]} ]; then
+            log_error "DAPI count mismatch for $roi_id: ${#scan_dapis[@]} scan vs ${#cycle1_dapis[@]} cycle1 ST-S"
+            # Restore anything already backed up
+            restore_cycle1_dapi "$roi_path"
+            return 1
+        fi
+
+        for i in "${!scan_dapis[@]}"; do
+            local cycle1_file="${cycle1_dapis[$i]}"
+            local scan_file="${scan_dapis[$i]}"
+            # Backup the original cycle1 DAPI
+            cp "$cycle1_file" "$backup_dir/"
+            # Overwrite cycle1 DAPI with scan DAPI (keep the cycle1 filename)
+            cp "$scan_file" "$cycle1_file"
+            total_swapped=$((total_swapped + 1))
+        done
+    done
+
+    log_info "Swapped $total_swapped scan DAPI tiles into Cycle1 in $roi_path (${#rois[@]} ROIs)"
     return 0
 }
 
-cleanup_cycle0() {
+restore_cycle1_dapi() {
     local roi_path="$1"
-    local cycle0_dir="${roi_path}/5_Cycle0"
+    local backup_dir="${roi_path}/.dapi_backup"
 
-    if [ -d "$cycle0_dir" ]; then
-        rm -rf "$cycle0_dir"
-        log_info "Cleaned up injected Cycle0 directory: $cycle0_dir"
+    if [ ! -d "$backup_dir" ]; then
+        return 0
     fi
+
+    local cycle1_dir
+    cycle1_dir=$(find "$roi_path" -maxdepth 1 -type d -name '*_Cycle1' | head -1)
+
+    if [ -z "$cycle1_dir" ]; then
+        log_error "Cannot restore DAPI: no *_Cycle1 directory found in $roi_path"
+        return 1
+    fi
+
+    local restored=0
+    for backup_file in "$backup_dir"/*.tif; do
+        [ -f "$backup_file" ] || continue
+        mv "$backup_file" "$cycle1_dir/"
+        restored=$((restored + 1))
+    done
+
+    rm -rf "$backup_dir"
+    log_info "Restored $restored original DAPI tiles in Cycle1 ($roi_path)"
+    return 0
 }
 
 # Return the highest-exposure directory under base_dir, or base_dir itself.
@@ -410,14 +498,21 @@ process_roi() {
                 rm -rf "$staged_dir"
             fi
         fi
-        if [ "$USE_OVERVIEW_SCAN_DAPI" = true ]; then
+        if [ "$USE_SCAN_DAPI" = true ]; then
             if [ "$DRY_RUN" = true ]; then
-                log_msg "  Would inject 3_Scan2 as Cycle0"
+                log_msg "  Would swap scan DAPI into Cycle1"
             else
-                inject_scan2_as_cycle0 "$roi_path"
+                swap_scan_dapi_into_cycle1 "$roi_path"
             fi
         fi
+        local staging_failed=false
         if ! stage_roi "$roi_path" "$staged_dir" "$roi_name"; then
+            staging_failed=true
+        fi
+        if [ "$USE_SCAN_DAPI" = true ] && [ "$DRY_RUN" = false ]; then
+            restore_cycle1_dapi "$roi_path"
+        fi
+        if [ "$staging_failed" = true ]; then
             if [ "$DRY_RUN" = false ]; then
                 log_error "FAILED - Staging failed for $roi_name"
                 echo "$roi_name,STAGING_FAILED,$(date '+%Y-%m-%d %H:%M:%S')" >> "${LOG_FILE%.log}_summary.csv"
@@ -447,9 +542,6 @@ process_roi() {
         echo "$roi_name,SUCCESS,$(date '+%Y-%m-%d %H:%M:%S')" >> "${LOG_FILE%.log}_summary.csv"
         if [ "$CLEANUP_STAGED" = true ]; then
             cleanup_staged "$staged_dir" "$roi_name"
-        fi
-        if [ "$USE_OVERVIEW_SCAN_DAPI" = true ]; then
-            cleanup_cycle0 "$roi_path"
         fi
     else
         if [ "$CLEANUP_STAGED" = true ]; then
@@ -552,8 +644,8 @@ print_config_summary() {
     if [ -n "$EXPERIMENT_FILTER" ]; then
         log_msg "Experiment filter:  $EXPERIMENT_FILTER"
     fi
-    if [ "$USE_OVERVIEW_SCAN_DAPI" = true ]; then
-        log_msg "Using 3_Scan2 DAPI as Cycle 0: YES"
+    if [ "$USE_SCAN_DAPI" = true ]; then
+        log_msg "Swap scan DAPI into Cycle1: YES"
     fi
     if [ "$USE_HIGHEST_EXPOSURE" = true ]; then
         log_msg "Using highest exposure only (-he for staging, highest folder for MCMICRO)"
@@ -688,8 +780,8 @@ while [[ $# -gt 0 ]]; do
             EXPERIMENT_FILTER="$2"
             shift 2
             ;;
-        --use-overview-scan-dapi)
-            USE_OVERVIEW_SCAN_DAPI=true
+        --use-scan-dapi)
+            USE_SCAN_DAPI=true
             shift
             ;;
         --highest-exposure-only|-he)
@@ -730,7 +822,7 @@ Optional arguments:
   --skip-exp <list>           Skip specific experiments (comma-separated)
   --skip-experiments <list>   Same as --skip-exp
   --experiment-filter REGEX   Only process experiments matching REGEX (bash regex)
-  --use-overview-scan-dapi    Use DAPI from 3_Scan2 as Cycle 0 (copies folder, renames files, cleans up on success)
+  --use-scan-dapi             Swap scan DAPI tiles into Cycle1 before staging (backs up originals, restores after)
   --highest-exposure-only     Use only highest exposure in staging (-he flag)
   -he                         Same as --highest-exposure-only
   --cleanup-staged            Delete staged raw data after successful processing
