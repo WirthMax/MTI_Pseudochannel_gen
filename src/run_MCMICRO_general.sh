@@ -29,7 +29,7 @@ PARAMS_FILE="${MCMICRO_PARAMS_FILE:-}"
 MCMICRO_OUTPUT_BASE="${MCMICRO_OUTPUT_DIR:-}"
 MCMICRO_WORK_DIR=""  # Derived from MCMICRO_OUTPUT_BASE in validate_config
 
-LOG_FILE="$(pwd)/macsima_pipeline_$(date +%Y%m%d_%H%M%S).log"
+LOG_FILE=""  # Set in validate_config once MCMICRO_OUTPUT_BASE is known
 
 # Counters (global, updated by processing functions)
 TOTAL_ROIS=0
@@ -123,6 +123,9 @@ validate_config() {
 
     # Derive work directory
     MCMICRO_WORK_DIR="${MCMICRO_OUTPUT_BASE}/work"
+
+    # Set log file path in the output directory (now that MCMICRO_OUTPUT_BASE is known)
+    LOG_FILE="${MCMICRO_OUTPUT_BASE}/macsima_pipeline_$(date +%Y%m%d_%H%M%S).log"
 }
 
 #==============================================================================
@@ -362,6 +365,7 @@ stage_roi() {
 
         # Run staging with singularity
         if singularity exec \
+            --pwd /tmp \
             --bind "$roi_path:/mnt,$output_dir:/media" \
             --no-home \
             "$STAGING_CONTAINER" \
