@@ -195,14 +195,6 @@ swap_scan_dapi_into_cycle1() {
         restore_cycle1_dapi "$roi_path"
     fi
 
-    # Clean up any stale Cycle0 directories from the old approach
-    for old_cycle0 in "${roi_path}"/*_Cycle0; do
-        if [ -d "$old_cycle0" ]; then
-            rm -rf "$old_cycle0"
-            log_info "Removed stale Cycle0 directory: $old_cycle0"
-        fi
-    done
-
     mkdir -p "$backup_dir"
 
     # Collect unique ROI identifiers from scan DAPI files
