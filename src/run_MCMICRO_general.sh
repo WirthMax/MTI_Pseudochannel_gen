@@ -265,6 +265,20 @@ swap_scan_dapi_into_cycle1() {
     done
 
     log_info "Swapped $total_swapped scan DAPI tiles into Cycle1 in $roi_path (${#rois[@]} ROIs)"
+
+    # Also move bleach (ST-B) files out of cycle1 so macsima2mc only produces the stain OME-TIFF.
+    # This prevents cross-round registration issues between bleach DAPI and scan DAPI.
+    local bleach_moved=0
+    for bleach_file in "$cycle1_dir"/*_ST-B_*.tif; do
+        [ -f "$bleach_file" ] || continue
+        mv "$bleach_file" "$backup_dir/"
+        bleach_moved=$((bleach_moved + 1))
+    done
+
+    if [ $bleach_moved -gt 0 ]; then
+        log_info "Moved $bleach_moved bleach (ST-B) files out of $cycle1_dir for staging"
+    fi
+
     return 0
 }
 
@@ -292,7 +306,7 @@ restore_cycle1_dapi() {
     done
 
     rm -rf "$backup_dir"
-    log_info "Restored $restored original DAPI tiles in Cycle1 ($roi_path)"
+    log_info "Restored $restored files to Cycle1 ($roi_path)"
     return 0
 }
 
