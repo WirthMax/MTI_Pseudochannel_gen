@@ -310,6 +310,39 @@ restore_cycle1_dapi() {
     return 0
 }
 
+clean_markers_background() {
+    local staged_dir="$1"
+
+    local markers_csv
+    while IFS= read -r markers_csv; do
+        [ -f "$markers_csv" ] || continue
+        python3 -c "
+import csv, sys
+
+path = sys.argv[1]
+with open(path) as f:
+    reader = csv.DictReader(f)
+    fieldnames = reader.fieldnames
+    rows = list(reader)
+
+existing = {r['marker_name'] for r in rows}
+cleaned = 0
+for r in rows:
+    bg = r.get('background', '')
+    if bg and bg not in existing:
+        r['background'] = ''
+        cleaned += 1
+
+if cleaned > 0:
+    with open(path, 'w', newline='') as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+    print(f'Cleared {cleaned} invalid background references in {path}')
+" "$markers_csv" 2>&1 | while read -r line; do log_info "$line"; done
+    done < <(find "$staged_dir" -name "markers.csv" -type f)
+}
+
 # Return the highest-exposure directory under base_dir, or base_dir itself.
 get_highest_exposure_dir() {
     local base_dir="$1"
@@ -530,6 +563,7 @@ process_roi() {
         fi
         if [ "$USE_SCAN_DAPI" = true ] && [ "$DRY_RUN" = false ]; then
             restore_cycle1_dapi "$roi_path"
+            clean_markers_background "$staged_dir"
         fi
         if [ "$staging_failed" = true ]; then
             if [ "$DRY_RUN" = false ]; then
