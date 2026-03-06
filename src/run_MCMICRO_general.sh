@@ -179,168 +179,80 @@ is_already_staged() {
     return 1
 }
 
-swap_scan_dapi_into_cycle1() {
+inject_scan_dapi() {
     local roi_path="$1"
+    local staged_dir="$2"
     local scan_dir="${roi_path}/3_Scan2"
-    local backup_dir="${roi_path}/.dapi_backup"
-
-    # Find the Cycle1 directory (e.g. 6_Cycle1)
-    local cycle1_dir
-    cycle1_dir=$(find "$roi_path" -maxdepth 1 -type d -name '*_Cycle1' | head -1)
 
     if [ ! -d "$scan_dir" ]; then
-        log_warning "3_Scan2 directory not found in $roi_path — skipping DAPI swap"
+        log_warning "3_Scan2 not found in $roi_path — skipping Scan DAPI injection"
         return 1
     fi
 
-    if [ -z "$cycle1_dir" ]; then
-        log_warning "No *_Cycle1 directory found in $roi_path — skipping DAPI swap"
+    # Create temp dir with renamed Scan DAPI tiles
+    local scan_cycle_dir="${roi_path}/.scan_staging"
+    rm -rf "$scan_cycle_dir"
+    mkdir -p "$scan_cycle_dir"
+
+    local file_count=0
+    for tif in "$scan_dir"/*_D-DAPI_*.tif; do
+        [ -f "$tif" ] || continue
+        cp "$tif" "$scan_cycle_dir/CYC-999_$(basename "$tif")"
+        file_count=$((file_count + 1))
+    done
+
+    if [ $file_count -eq 0 ]; then
+        log_warning "No DAPI tiles found in $scan_dir"
+        rm -rf "$scan_cycle_dir"
         return 1
     fi
 
-    # If backup already exists (interrupted previous run), restore first
-    if [ -d "$backup_dir" ]; then
-        log_warning "Found stale .dapi_backup in $roi_path — restoring before re-swapping"
-        restore_cycle1_dapi "$roi_path"
-    fi
+    log_info "Prepared $file_count Scan DAPI tiles as CYC-999"
 
-    mkdir -p "$backup_dir"
+    # Stage with macsima2mc (same as any cycle)
+    local he_flag=""
+    [ "$USE_HIGHEST_EXPOSURE" = true ] && he_flag="-he"
 
-    # Collect unique ROI identifiers from scan DAPI files
-    local rois=()
-    local roi_id
-    for f in "$scan_dir"/*_D-DAPI_*.tif; do
-        [ -f "$f" ] || continue
-        roi_id=$(basename "$f" | grep -oE 'ROI-[0-9]+')
-        if [ -n "$roi_id" ]; then
-            local found=false
-            for r in "${rois[@]+"${rois[@]}"}"; do
-                if [ "$r" = "$roi_id" ]; then
-                    found=true
-                    break
-                fi
-            done
-            if [ "$found" = false ]; then
-                rois+=("$roi_id")
-            fi
-        fi
-    done
-
-    if [ ${#rois[@]} -eq 0 ]; then
-        log_warning "No DAPI files found in $scan_dir — skipping DAPI swap"
-        rmdir "$backup_dir" 2>/dev/null || true
+    if singularity exec \
+        --pwd /tmp \
+        --bind "$roi_path:/mnt,$staged_dir:/media" \
+        --no-home \
+        "$STAGING_CONTAINER" \
+        python /staging/macsima2mc/macsima2mc.py \
+        -i "/mnt/.scan_staging" \
+        -rm "$REFERENCE_MARKER" \
+        -rr \
+        -o "/media/1" \
+        -ic \
+        $he_flag >> "$LOG_FILE" 2>&1; then
+        log_info "Scan DAPI staged as extra ASHLAR round"
+    else
+        log_error "Failed to stage Scan DAPI tiles"
+        rm -rf "$scan_cycle_dir"
         return 1
     fi
 
-    local total_swapped=0
-    for roi_id in "${rois[@]}"; do
-        # Collect scan DAPI files for this ROI, sorted by F-number
-        local scan_dapis=()
-        while IFS= read -r f; do
-            scan_dapis+=("$f")
-        done < <(find "$scan_dir" -name "*_${roi_id}_*_D-DAPI_*.tif" -type f | sort -V)
-
-        # Collect Cycle1 Stain DAPI files for this ROI, sorted by F-number
-        local cycle1_dapis=()
-        while IFS= read -r f; do
-            cycle1_dapis+=("$f")
-        done < <(find "$cycle1_dir" -name "*_ST-S_*_${roi_id}_*_D-DAPI_*.tif" -type f | sort -V)
-
-        if [ ${#scan_dapis[@]} -ne ${#cycle1_dapis[@]} ]; then
-            log_error "DAPI count mismatch for $roi_id: ${#scan_dapis[@]} scan vs ${#cycle1_dapis[@]} cycle1 ST-S"
-            # Restore anything already backed up
-            restore_cycle1_dapi "$roi_path"
-            return 1
-        fi
-
-        while IFS=$'\t' read -r scan_file cycle1_file; do
-            # Backup the original cycle1 DAPI
-            cp "$cycle1_file" "$backup_dir/"
-            # Overwrite cycle1 DAPI with scan DAPI (keep the cycle1 filename)
-            cp "$scan_file" "$cycle1_file"
-            total_swapped=$((total_swapped + 1))
-        done < <(paste \
-            <(printf '%s\n' "${scan_dapis[@]}") \
-            <(printf '%s\n' "${cycle1_dapis[@]}"))
-    done
-
-    log_info "Swapped $total_swapped scan DAPI tiles into Cycle1 in $roi_path (${#rois[@]} ROIs)"
-
-    # Also move bleach (ST-B) files out of cycle1 so macsima2mc only produces the stain OME-TIFF.
-    # This prevents cross-round registration issues between bleach DAPI and scan DAPI.
-    local bleach_moved=0
-    for bleach_file in "$cycle1_dir"/*_ST-B_*.tif; do
-        [ -f "$bleach_file" ] || continue
-        mv "$bleach_file" "$backup_dir/"
-        bleach_moved=$((bleach_moved + 1))
-    done
-
-    if [ $bleach_moved -gt 0 ]; then
-        log_info "Moved $bleach_moved bleach (ST-B) files out of $cycle1_dir for staging"
-    fi
-
+    # Clean up temp dir
+    rm -rf "$scan_cycle_dir"
     return 0
 }
 
-restore_cycle1_dapi() {
-    local roi_path="$1"
-    local backup_dir="${roi_path}/.dapi_backup"
-
-    if [ ! -d "$backup_dir" ]; then
-        return 0
-    fi
-
-    local cycle1_dir
-    cycle1_dir=$(find "$roi_path" -maxdepth 1 -type d -name '*_Cycle1' | head -1)
-
-    if [ -z "$cycle1_dir" ]; then
-        log_error "Cannot restore DAPI: no *_Cycle1 directory found in $roi_path"
-        return 1
-    fi
-
-    local restored=0
-    for backup_file in "$backup_dir"/*.tif; do
-        [ -f "$backup_file" ] || continue
-        mv "$backup_file" "$cycle1_dir/"
-        restored=$((restored + 1))
-    done
-
-    rm -rf "$backup_dir"
-    log_info "Restored $restored files to Cycle1 ($roi_path)"
-    return 0
-}
-
-clean_markers_background() {
+replace_dapi_with_scan() {
     local staged_dir="$1"
+    local roi_name="$2"
 
-    local markers_csv
-    while IFS= read -r markers_csv; do
-        [ -f "$markers_csv" ] || continue
-        python3 -c "
-import csv, sys
+    local mcmicro_input
+    mcmicro_input=$(get_highest_exposure_dir "$staged_dir")
 
-path = sys.argv[1]
-with open(path) as f:
-    reader = csv.DictReader(f)
-    fieldnames = reader.fieldnames
-    rows = list(reader)
-
-existing = {r['marker_name'] for r in rows}
-cleaned = 0
-for r in rows:
-    bg = r.get('background', '')
-    if bg and bg not in existing:
-        r['background'] = ''
-        cleaned += 1
-
-if cleaned > 0:
-    with open(path, 'w', newline='') as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
-        writer.writeheader()
-        writer.writerows(rows)
-    print(f'Cleared {cleaned} invalid background references in {path}')
-" "$markers_csv" 2>&1 | while read -r line; do log_info "$line"; done
-    done < <(find "$staged_dir" -name "markers.csv" -type f)
+    if python3 "$(dirname "$0")/swap_dapi_channel.py" \
+        --registration-dir "$mcmicro_input/registration" \
+        --backsub-dir "$mcmicro_input/backsub" \
+        --markers-csv "$mcmicro_input/markers.csv" >> "$LOG_FILE" 2>&1; then
+        log_info "Replaced DAPI channel with Scan DAPI for $roi_name"
+    else
+        log_error "Failed to replace DAPI channel for $roi_name"
+        return 1
+    fi
 }
 
 # Return the highest-exposure directory under base_dir, or base_dir itself.
@@ -550,20 +462,17 @@ process_roi() {
                 rm -rf "$staged_dir"
             fi
         fi
-        if [ "$USE_SCAN_DAPI" = true ]; then
-            if [ "$DRY_RUN" = true ]; then
-                log_msg "  Would swap scan DAPI into Cycle1"
-            else
-                swap_scan_dapi_into_cycle1 "$roi_path"
-            fi
-        fi
         local staging_failed=false
         if ! stage_roi "$roi_path" "$staged_dir" "$roi_name"; then
             staging_failed=true
         fi
-        if [ "$USE_SCAN_DAPI" = true ] && [ "$DRY_RUN" = false ]; then
-            restore_cycle1_dapi "$roi_path"
-            clean_markers_background "$staged_dir"
+        # Inject Scan DAPI as extra ASHLAR round (after normal staging)
+        if [ "$USE_SCAN_DAPI" = true ] && [ "$staging_failed" = false ]; then
+            if [ "$DRY_RUN" = true ]; then
+                log_msg "  Would inject Scan DAPI as extra ASHLAR round (CYC-999)"
+            else
+                inject_scan_dapi "$roi_path" "$staged_dir"
+            fi
         fi
         if [ "$staging_failed" = true ]; then
             if [ "$DRY_RUN" = false ]; then
@@ -588,6 +497,15 @@ process_roi() {
             cleanup_mcmicro_work "$roi_name"
         fi
         return 1
+    fi
+
+    # Replace DAPI channel in backsub output with registered Scan DAPI
+    if [ "$USE_SCAN_DAPI" = true ]; then
+        if [ "$DRY_RUN" = true ]; then
+            log_msg "  Would replace DAPI channel in backsub with Scan DAPI"
+        else
+            replace_dapi_with_scan "$staged_dir" "$roi_name"
+        fi
     fi
 
     if [ "$DRY_RUN" = false ]; then
@@ -698,7 +616,7 @@ print_config_summary() {
         log_msg "Experiment filter:  $EXPERIMENT_FILTER"
     fi
     if [ "$USE_SCAN_DAPI" = true ]; then
-        log_msg "Swap scan DAPI into Cycle1: YES"
+        log_msg "Use Scan DAPI: YES (inject as ASHLAR round, replace in backsub)"
     fi
     if [ "$USE_HIGHEST_EXPOSURE" = true ]; then
         log_msg "Using highest exposure only (-he for staging, highest folder for MCMICRO)"
@@ -875,7 +793,7 @@ Optional arguments:
   --skip-exp <list>           Skip specific experiments (comma-separated)
   --skip-experiments <list>   Same as --skip-exp
   --experiment-filter REGEX   Only process experiments matching REGEX (bash regex)
-  --use-scan-dapi             Swap scan DAPI tiles into Cycle1 before staging (backs up originals, restores after)
+  --use-scan-dapi             Inject Scan DAPI as extra ASHLAR round and replace DAPI in backsub output
   --highest-exposure-only     Use only highest exposure in staging (-he flag)
   -he                         Same as --highest-exposure-only
   --cleanup-staged            Delete staged raw data after successful processing
