@@ -237,17 +237,59 @@ inject_scan_dapi() {
     return 0
 }
 
-# Search staged_dir recursively for a registered Scan DAPI TIFF (cycle 999).
+# Ensure CYC-999 tiles are in the exposure directory MCMICRO will use.
+# After inject_scan_dapi(), macsima2mc may place CYC-999 in a lower exposure
+# sub-dir (e.g. exp-1/) while MCMICRO uses the highest (e.g. exp-2/).
+reconcile_scan_dapi() {
+    local staged_dir="$1"
+    local mcmicro_input
+    mcmicro_input=$(get_highest_exposure_dir "$staged_dir")
+    local target_markers="$mcmicro_input/markers.csv"
+
+    # If cycle 999 already in the right markers.csv, nothing to do
+    if grep -q ',999,' "$target_markers" 2>/dev/null; then
+        log_info "Cycle 999 already in target markers.csv"
+        return 0
+    fi
+
+    # Search other markers.csv files for cycle 999
+    local source_markers=""
+    while IFS= read -r csv; do
+        if grep -q ',999,' "$csv" 2>/dev/null; then
+            source_markers="$csv"
+            break
+        fi
+    done < <(find "$staged_dir" -name markers.csv ! -path "$target_markers")
+
+    if [ -z "$source_markers" ]; then
+        log_warning "Cycle 999 not found in any markers.csv — cannot reconcile"
+        return 1
+    fi
+
+    local source_dir
+    source_dir=$(dirname "$source_markers")
+    log_info "Reconciling: cycle 999 found in $source_dir, moving to $mcmicro_input"
+
+    # Copy CYC-999 raw tiles to target raw directory
+    for tile in "$source_dir"/raw/*cycle*999*; do
+        [ -f "$tile" ] || continue
+        cp "$tile" "$mcmicro_input/raw/"
+        log_info "  Copied $(basename "$tile") to target raw/"
+    done
+
+    # Append cycle 999 lines to target markers.csv
+    grep ',999,' "$source_markers" >> "$target_markers"
+    log_info "  Appended cycle 999 entry to target markers.csv"
+}
+
+# Search staged_dir for a registered Scan DAPI TIFF (cycle 999).
+# Only returns registered mosaics — never raw tiles (individual FOVs).
 # Prints the path if found, returns 1 otherwise.
 find_scan_dapi_file() {
     local staged_dir="$1"
     local match
-    match=$(find "$staged_dir" -path '*/raw/corr_cycle-999*DAPI*' \( -name '*.tif' -o -name '*.tiff' \) -print -quit 2>/dev/null)
-    if [ -n "$match" ]; then
-        echo "$match"
-        return 0
-    fi
-    match=$(find "$staged_dir" -path '*/registration/*' -name '*cycle*999*DAPI*' \( -name '*.tif' -o -name '*.tiff' \) -print -quit 2>/dev/null)
+    match=$(find "$staged_dir" -path '*/registration/*' -name '*cycle*999*' \
+            \( -name '*.tif' -o -name '*.tiff' \) -print -quit 2>/dev/null)
     if [ -n "$match" ]; then
         echo "$match"
         return 0
@@ -507,6 +549,7 @@ process_roi() {
                 log_msg "  Would inject Scan DAPI as extra ASHLAR round (CYC-999)"
             else
                 inject_scan_dapi "$roi_path" "$staged_dir"
+                reconcile_scan_dapi "$staged_dir"
             fi
         fi
         if [ "$staging_failed" = true ]; then

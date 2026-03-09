@@ -60,18 +60,14 @@ log() {
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*"
 }
 
-# Search staged_dir recursively for a registered Scan DAPI TIFF (cycle 999).
+# Search staged_dir for a registered Scan DAPI TIFF (cycle 999).
+# Only returns registered mosaics — never raw tiles (individual FOVs).
 # Prints the path if found, returns 1 otherwise.
 find_scan_dapi_file() {
     local staged_dir="$1"
     local match
-    match=$(find "$staged_dir" -path '*/raw/corr_cycle-999*DAPI*' \( -name '*.tif' -o -name '*.tiff' \) -print -quit 2>/dev/null)
-    if [ -n "$match" ]; then
-        echo "$match"
-        return 0
-    fi
-    # Also check registration/ for an already-registered cycle-999 TIFF
-    match=$(find "$staged_dir" -path '*/registration/*' -name '*cycle*999*DAPI*' \( -name '*.tif' -o -name '*.tiff' \) -print -quit 2>/dev/null)
+    match=$(find "$staged_dir" -path '*/registration/*' -name '*cycle*999*' \
+            \( -name '*.tif' -o -name '*.tiff' \) -print -quit 2>/dev/null)
     if [ -n "$match" ]; then
         echo "$match"
         return 0

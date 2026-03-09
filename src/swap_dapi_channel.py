@@ -174,7 +174,9 @@ def main():
         if scan_data.shape != (page.shape[0], page.shape[1]):
             raise ValueError(
                 f"Shape mismatch: Scan DAPI {scan_data.shape} vs "
-                f"backsub channel {page.shape}"
+                f"backsub channel {(page.shape[0], page.shape[1])}. "
+                f"The Scan DAPI may be an unstitched raw tile — "
+                f"ensure it was processed through ASHLAR registration."
             )
 
         contiguous = page.is_contiguous
