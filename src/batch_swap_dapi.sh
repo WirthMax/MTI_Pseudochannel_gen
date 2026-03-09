@@ -4,7 +4,7 @@
 # Batch DAPI Swap for Existing MCMICRO Outputs
 #
 # Retroactively runs swap_dapi_channel.py on all *_staged directories that
-# have registration/, backsub/, and markers.csv outputs from MCMICRO.
+# have registration/, background/, and markers.csv outputs from MCMICRO.
 ################################################################################
 
 set -euo pipefail
@@ -18,7 +18,7 @@ DRY_RUN=false
 
 usage() {
     cat <<EOF
-Batch DAPI Swap — replace Cycle1 DAPI with registered Scan DAPI in backsub outputs.
+Batch DAPI Swap — replace Cycle1 DAPI with registered Scan DAPI in background outputs.
 
 Usage: $0 <staging-base-dir> [--dry-run]
 
@@ -127,13 +127,13 @@ for staged_dir in "$STAGING_BASE_DIR"/*_staged/; do
     mcmicro_dir=$(get_highest_exposure_dir "$staged_dir")
 
     reg_dir="$mcmicro_dir/registration"
-    backsub_dir="$mcmicro_dir/backsub"
+    backsub_dir="$mcmicro_dir/background"
     markers_csv="$mcmicro_dir/markers.csv"
 
     # Check prerequisites
     missing=""
     [ ! -d "$reg_dir" ] && missing="${missing} registration/"
-    [ ! -d "$backsub_dir" ] && missing="${missing} backsub/"
+    [ ! -d "$backsub_dir" ] && missing="${missing} background/"
     [ ! -f "$markers_csv" ] && missing="${missing} markers.csv"
 
     if [ -n "$missing" ]; then

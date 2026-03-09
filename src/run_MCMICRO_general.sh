@@ -246,7 +246,7 @@ replace_dapi_with_scan() {
 
     if python3 "$(dirname "$0")/swap_dapi_channel.py" \
         --registration-dir "$mcmicro_input/registration" \
-        --backsub-dir "$mcmicro_input/backsub" \
+        --backsub-dir "$mcmicro_input/background" \
         --markers-csv "$mcmicro_input/markers.csv" >> "$LOG_FILE" 2>&1; then
         log_info "Replaced DAPI channel with Scan DAPI for $roi_name"
     else
@@ -502,7 +502,7 @@ process_roi() {
     # Replace DAPI channel in backsub output with registered Scan DAPI
     if [ "$USE_SCAN_DAPI" = true ]; then
         if [ "$DRY_RUN" = true ]; then
-            log_msg "  Would replace DAPI channel in backsub with Scan DAPI"
+            log_msg "  Would replace DAPI channel in background with Scan DAPI"
         else
             replace_dapi_with_scan "$staged_dir" "$roi_name"
         fi
@@ -616,7 +616,7 @@ print_config_summary() {
         log_msg "Experiment filter:  $EXPERIMENT_FILTER"
     fi
     if [ "$USE_SCAN_DAPI" = true ]; then
-        log_msg "Use Scan DAPI: YES (inject as ASHLAR round, replace in backsub)"
+        log_msg "Use Scan DAPI: YES (inject as ASHLAR round, replace in background)"
     fi
     if [ "$USE_HIGHEST_EXPOSURE" = true ]; then
         log_msg "Using highest exposure only (-he for staging, highest folder for MCMICRO)"
@@ -793,7 +793,7 @@ Optional arguments:
   --skip-exp <list>           Skip specific experiments (comma-separated)
   --skip-experiments <list>   Same as --skip-exp
   --experiment-filter REGEX   Only process experiments matching REGEX (bash regex)
-  --use-scan-dapi             Inject Scan DAPI as extra ASHLAR round and replace DAPI in backsub output
+  --use-scan-dapi             Inject Scan DAPI as extra ASHLAR round and replace DAPI in background output
   --highest-exposure-only     Use only highest exposure in staging (-he flag)
   -he                         Same as --highest-exposure-only
   --cleanup-staged            Delete staged raw data after successful processing
