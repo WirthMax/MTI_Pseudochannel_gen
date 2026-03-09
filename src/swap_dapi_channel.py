@@ -161,43 +161,45 @@ def main():
         with tifffile.TiffFile(reg_tiff) as tif:
             scan_data = tif.pages[reg_channel].asarray()
 
-    # --- 3. Read backsub OME-TIFF ---
+    # --- 3. Read backsub and replace target channel ---
     backsub_tiff = find_single_tiff(args.backsub_dir, "backsub")
-    print(f"Reading backsub from {backsub_tiff.name}")
+    print(f"Backsub TIFF: {backsub_tiff.name}")
 
-    backsub_data = tifffile.imread(backsub_tiff)
-
-    # Handle both (C, Y, X) and (Y, X) shapes
-    if backsub_data.ndim == 2:
-        raise ValueError("Backsub TIFF has only one page — cannot replace channel")
-
-    # --- 4. Verify dimensions match ---
-    if scan_data.shape != backsub_data[backsub_channel].shape:
-        raise ValueError(
-            f"Shape mismatch: Scan DAPI {scan_data.shape} vs "
-            f"backsub channel {backsub_data[backsub_channel].shape}"
-        )
-
-    # --- 5. Replace ---
-    backsub_data[backsub_channel] = scan_data.astype(backsub_data.dtype)
-    print(f"Replaced backsub page {backsub_channel} with Scan DAPI")
-
-    # --- 6. Write back ---
-    # Read OME metadata if present, to preserve it
     with tifffile.TiffFile(backsub_tiff) as tif:
-        ome_metadata = tif.ome_metadata
+        if len(tif.pages) < 2:
+            raise ValueError("Backsub TIFF has only one page — cannot replace channel")
 
-    if ome_metadata:
-        tifffile.imwrite(
-            backsub_tiff,
-            backsub_data,
-            ome=True,
-            description=ome_metadata,
-        )
-    else:
-        tifffile.imwrite(backsub_tiff, backsub_data)
+        page = tif.pages[backsub_channel]
 
-    print(f"Wrote updated backsub to {backsub_tiff.name}")
+        if scan_data.shape != (page.shape[0], page.shape[1]):
+            raise ValueError(
+                f"Shape mismatch: Scan DAPI {scan_data.shape} vs "
+                f"backsub channel {page.shape}"
+            )
+
+        contiguous = page.is_contiguous
+        if contiguous:
+            # Fast path: overwrite page bytes in-place via memmap
+            offset, size = contiguous
+            print(f"In-place replacing backsub page {backsub_channel} (offset {offset})")
+            mm = np.memmap(
+                backsub_tiff, dtype=page.dtype, mode="r+",
+                offset=offset, shape=page.shape,
+            )
+            mm[:] = scan_data.astype(page.dtype)
+            del mm  # flush to disk
+        else:
+            # Fallback: read all channels, modify, write back
+            print(f"Page not contiguous — falling back to full read/write")
+            ome_metadata = tif.ome_metadata
+            backsub_data = tifffile.imread(backsub_tiff)
+            backsub_data[backsub_channel] = scan_data.astype(backsub_data.dtype)
+            if ome_metadata:
+                tifffile.imwrite(backsub_tiff, backsub_data, ome=True, description=ome_metadata)
+            else:
+                tifffile.imwrite(backsub_tiff, backsub_data)
+
+    print(f"Replaced backsub page {backsub_channel} with Scan DAPI")
 
 
 if __name__ == "__main__":
