@@ -7,6 +7,12 @@ After MCMICRO runs with the Scan DAPI injected as an extra ASHLAR round
      Cycle1 DAPI channel (earliest cycle, not removed).
   2. Extracts the Scan DAPI plane from the registration mosaic.
   3. Overwrites the corresponding DAPI plane in the backsub OME-TIFF.
+
+Two modes of operation:
+  A) --registration-dir: Extract Scan DAPI from the registration mosaic
+     using the cycle 999 entry in markers.csv (legacy).
+  B) --scan-dapi-file: Read Scan DAPI directly from a standalone TIFF file.
+     Use this when cycle 999 ended up in a separate exposure folder.
 """
 
 import argparse
@@ -81,13 +87,32 @@ def find_single_tiff(directory: Path, label: str) -> Path:
     return tiffs[0]
 
 
+def read_scan_dapi_from_file(tiff_path: Path) -> np.ndarray:
+    """Read Scan DAPI from a standalone TIFF file.
+
+    Handles multi-page TIFFs by taking the first page.
+    Validates that the result is a 2D image.
+    """
+    with tifffile.TiffFile(tiff_path) as tif:
+        if len(tif.pages) > 1:
+            print(f"Warning: {tiff_path.name} has {len(tif.pages)} pages, using first")
+        data = tif.pages[0].asarray()
+
+    if data.ndim != 2:
+        raise ValueError(
+            f"Expected 2D image from {tiff_path.name}, got shape {data.shape}"
+        )
+    return data
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Replace DAPI in backsub with registered Scan DAPI"
     )
     parser.add_argument(
-        "--registration-dir", required=True, type=Path,
-        help="Path to MCMICRO registration/ directory",
+        "--registration-dir", type=Path,
+        help="Path to MCMICRO registration/ directory "
+             "(required unless --scan-dapi-file is given)",
     )
     parser.add_argument(
         "--backsub-dir", required=True, type=Path,
@@ -97,33 +122,44 @@ def main():
         "--markers-csv", required=True, type=Path,
         help="Path to markers.csv",
     )
+    parser.add_argument(
+        "--scan-dapi-file", type=Path,
+        help="Path to a standalone Scan DAPI TIFF file. "
+             "Use when cycle 999 is in a separate exposure folder.",
+    )
     args = parser.parse_args()
+
+    # Validate: need either --scan-dapi-file or --registration-dir
+    if not args.scan_dapi_file and not args.registration_dir:
+        parser.error("one of --scan-dapi-file or --registration-dir is required")
 
     # --- 1. Parse markers ---
     rows = parse_markers(args.markers_csv)
-    scan_dapi = find_scan_dapi(rows)
     cycle1_dapi = find_cycle1_dapi(rows)
-
-    # Registration mosaic channel index (0-based from 1-based channel_number)
-    reg_channel = int(scan_dapi["channel_number"]) - 1
-    # Backsub channel index (0-based, skipping removed channels)
     backsub_channel = compute_backsub_index(rows, cycle1_dapi)
 
-    print(
-        f"Scan DAPI: channel_number={scan_dapi['channel_number']} "
-        f"(registration page {reg_channel})"
-    )
     print(
         f"Cycle1 DAPI: channel_number={cycle1_dapi['channel_number']} "
         f"(backsub page {backsub_channel})"
     )
 
-    # --- 2. Read Scan DAPI from registration mosaic ---
-    reg_tiff = find_single_tiff(args.registration_dir, "registration")
-    print(f"Reading Scan DAPI from {reg_tiff.name}, page {reg_channel}")
-
-    with tifffile.TiffFile(reg_tiff) as tif:
-        scan_data = tif.pages[reg_channel].asarray()
+    # --- 2. Read Scan DAPI ---
+    if args.scan_dapi_file:
+        # Direct file path — skip markers.csv cycle-999 lookup
+        print(f"Reading Scan DAPI from file: {args.scan_dapi_file}")
+        scan_data = read_scan_dapi_from_file(args.scan_dapi_file)
+    else:
+        # Legacy path — extract from registration mosaic via cycle-999
+        scan_dapi = find_scan_dapi(rows)
+        reg_channel = int(scan_dapi["channel_number"]) - 1
+        print(
+            f"Scan DAPI: channel_number={scan_dapi['channel_number']} "
+            f"(registration page {reg_channel})"
+        )
+        reg_tiff = find_single_tiff(args.registration_dir, "registration")
+        print(f"Reading Scan DAPI from {reg_tiff.name}, page {reg_channel}")
+        with tifffile.TiffFile(reg_tiff) as tif:
+            scan_data = tif.pages[reg_channel].asarray()
 
     # --- 3. Read backsub OME-TIFF ---
     backsub_tiff = find_single_tiff(args.backsub_dir, "backsub")

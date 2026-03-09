@@ -237,6 +237,24 @@ inject_scan_dapi() {
     return 0
 }
 
+# Search staged_dir recursively for a registered Scan DAPI TIFF (cycle 999).
+# Prints the path if found, returns 1 otherwise.
+find_scan_dapi_file() {
+    local staged_dir="$1"
+    local match
+    match=$(find "$staged_dir" -path '*/raw/corr_cycle-999*DAPI*' \( -name '*.tif' -o -name '*.tiff' \) -print -quit 2>/dev/null)
+    if [ -n "$match" ]; then
+        echo "$match"
+        return 0
+    fi
+    match=$(find "$staged_dir" -path '*/registration/*' -name '*cycle*999*DAPI*' \( -name '*.tif' -o -name '*.tiff' \) -print -quit 2>/dev/null)
+    if [ -n "$match" ]; then
+        echo "$match"
+        return 0
+    fi
+    return 1
+}
+
 replace_dapi_with_scan() {
     local staged_dir="$1"
     local roi_name="$2"
@@ -244,10 +262,27 @@ replace_dapi_with_scan() {
     local mcmicro_input
     mcmicro_input=$(get_highest_exposure_dir "$staged_dir")
 
+    local markers_csv="$mcmicro_input/markers.csv"
+    local swap_args=()
+
+    if grep -q ',999,' "$markers_csv" 2>/dev/null; then
+        # Cycle 999 in this markers.csv — use legacy registration path
+        swap_args+=(--registration-dir "$mcmicro_input/registration")
+    else
+        # Cycle 999 not in this markers.csv — look for standalone DAPI file
+        local scan_dapi_path=""
+        if scan_dapi_path=$(find_scan_dapi_file "$staged_dir"); then
+            swap_args+=(--scan-dapi-file "$scan_dapi_path")
+        else
+            log_warning "No cycle 999 in markers.csv and no Scan DAPI file found for $roi_name"
+            return 1
+        fi
+    fi
+
     if python3 "$(dirname "$0")/swap_dapi_channel.py" \
-        --registration-dir "$mcmicro_input/registration" \
+        "${swap_args[@]}" \
         --backsub-dir "$mcmicro_input/background" \
-        --markers-csv "$mcmicro_input/markers.csv" >> "$LOG_FILE" 2>&1; then
+        --markers-csv "$markers_csv" >> "$LOG_FILE" 2>&1; then
         log_info "Replaced DAPI channel with Scan DAPI for $roi_name"
     else
         log_error "Failed to replace DAPI channel for $roi_name"

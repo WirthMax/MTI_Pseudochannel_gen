@@ -60,6 +60,25 @@ log() {
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*"
 }
 
+# Search staged_dir recursively for a registered Scan DAPI TIFF (cycle 999).
+# Prints the path if found, returns 1 otherwise.
+find_scan_dapi_file() {
+    local staged_dir="$1"
+    local match
+    match=$(find "$staged_dir" -path '*/raw/corr_cycle-999*DAPI*' \( -name '*.tif' -o -name '*.tiff' \) -print -quit 2>/dev/null)
+    if [ -n "$match" ]; then
+        echo "$match"
+        return 0
+    fi
+    # Also check registration/ for an already-registered cycle-999 TIFF
+    match=$(find "$staged_dir" -path '*/registration/*' -name '*cycle*999*DAPI*' \( -name '*.tif' -o -name '*.tiff' \) -print -quit 2>/dev/null)
+    if [ -n "$match" ]; then
+        echo "$match"
+        return 0
+    fi
+    return 1
+}
+
 #==============================================================================
 # ARGUMENT PARSING
 #==============================================================================
@@ -142,9 +161,27 @@ for staged_dir in "$STAGING_BASE_DIR"/*_staged/; do
         continue
     fi
 
+    # Determine how to find the Scan DAPI: cycle 999 in markers.csv or standalone file
+    swap_args=()
+    if grep -q ',999,' "$markers_csv" 2>/dev/null; then
+        # Cycle 999 is in this markers.csv — use legacy registration path
+        swap_args+=(--registration-dir "$reg_dir")
+    else
+        # Cycle 999 not in this markers.csv — look for standalone DAPI file
+        scan_dapi_path=""
+        if scan_dapi_path=$(find_scan_dapi_file "$staged_dir"); then
+            swap_args+=(--scan-dapi-file "$scan_dapi_path")
+        else
+            log "SKIP $roi_name — no cycle 999 in markers.csv and no Scan DAPI file found"
+            skipped=$((skipped + 1))
+            continue
+        fi
+    fi
+
     if [ "$DRY_RUN" = true ]; then
         log "[DRY-RUN] Would process: $roi_name"
         log "[DRY-RUN]   MCMICRO dir: $mcmicro_dir"
+        log "[DRY-RUN]   swap args: ${swap_args[*]}"
         processed=$((processed + 1))
         continue
     fi
@@ -153,7 +190,7 @@ for staged_dir in "$STAGING_BASE_DIR"/*_staged/; do
     log "  MCMICRO dir: $mcmicro_dir"
 
     if python3 "$SCRIPT_DIR/swap_dapi_channel.py" \
-        --registration-dir "$reg_dir" \
+        "${swap_args[@]}" \
         --backsub-dir "$backsub_dir" \
         --markers-csv "$markers_csv"; then
         log "SUCCESS: $roi_name"
