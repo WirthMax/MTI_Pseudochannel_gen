@@ -282,6 +282,44 @@ swap_scan_dapi_into_cycle1() {
     return 0
 }
 
+duplicate_cycle1_as_cycle999() {
+    local roi_path="$1"
+
+    # Find the Cycle1 directory (e.g. 6_Cycle1)
+    local cycle1_dir
+    cycle1_dir=$(find "$roi_path" -maxdepth 1 -type d -name '*_Cycle1' | head -1)
+
+    if [ -z "$cycle1_dir" ]; then
+        log_warning "No *_Cycle1 directory found in $roi_path — skipping Cycle999 duplication"
+        return 1
+    fi
+
+    # Determine the directory prefix number (e.g. "6" from "6_Cycle1") and create 999_Cycle999
+    local cycle999_dir="${roi_path}/999_Cycle999"
+    mkdir -p "$cycle999_dir"
+
+    # Copy only stain files (ST-S: DAPI + markers) from Cycle1
+    local copied=0
+    for stain_file in "$cycle1_dir"/*_ST-S_*.tif; do
+        [ -f "$stain_file" ] || continue
+        local basename_f
+        basename_f=$(basename "$stain_file")
+        # Rename CYC-001 → CYC-999 in filename
+        local new_name="${basename_f//CYC-001/CYC-999}"
+        cp "$stain_file" "$cycle999_dir/$new_name"
+        copied=$((copied + 1))
+    done
+
+    if [ $copied -eq 0 ]; then
+        log_warning "No ST-S files found in $cycle1_dir — removing empty Cycle999 dir"
+        rmdir "$cycle999_dir" 2>/dev/null || true
+        return 1
+    fi
+
+    log_info "Duplicated $copied Cycle1 stain files into $cycle999_dir (CYC-001 → CYC-999)"
+    return 0
+}
+
 restore_cycle1_dapi() {
     local roi_path="$1"
     local backup_dir="${roi_path}/.dapi_backup"
@@ -307,6 +345,14 @@ restore_cycle1_dapi() {
 
     rm -rf "$backup_dir"
     log_info "Restored $restored files to Cycle1 ($roi_path)"
+
+    # Remove the fake Cycle999 directory if it exists (created by duplicate_cycle1_as_cycle999)
+    local cycle999_dir="${roi_path}/999_Cycle999"
+    if [ -d "$cycle999_dir" ]; then
+        rm -rf "$cycle999_dir"
+        log_info "Removed Cycle999 duplicate directory ($roi_path)"
+    fi
+
     return 0
 }
 
@@ -339,6 +385,44 @@ if cleaned > 0:
         writer.writeheader()
         writer.writerows(rows)
     print(f'Cleared {cleaned} invalid background references in {path}')
+" "$markers_csv" 2>&1 | while read -r line; do log_info "$line"; done
+    done < <(find "$staged_dir" -name "markers.csv" -type f)
+}
+
+mark_cycle1_markers_removed() {
+    local staged_dir="$1"
+
+    local markers_csv
+    while IFS= read -r markers_csv; do
+        [ -f "$markers_csv" ] || continue
+        python3 -c "
+import csv, sys
+
+path = sys.argv[1]
+with open(path) as f:
+    reader = csv.DictReader(f)
+    fieldnames = reader.fieldnames
+    rows = list(reader)
+
+marked = 0
+for r in rows:
+    cycle = int(r.get('cycle_number', 0))
+    marker = r.get('marker_name', '')
+    # Cycle 1 non-DAPI markers are misaligned (acquired at original positions, not Scan positions)
+    if cycle == 1 and marker != 'DAPI':
+        r['remove'] = 'TRUE'
+        marked += 1
+    # Cycle 999 DAPI is the original bad-quality DAPI — only needed for alignment
+    elif cycle == 999 and marker == 'DAPI':
+        r['remove'] = 'TRUE'
+        marked += 1
+
+if marked > 0:
+    with open(path, 'w', newline='') as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+    print(f'Marked {marked} channels as remove=TRUE in {path} (Cycle1 markers + Cycle999 DAPI)')
 " "$markers_csv" 2>&1 | while read -r line; do log_info "$line"; done
     done < <(find "$staged_dir" -name "markers.csv" -type f)
 }
@@ -553,8 +637,10 @@ process_roi() {
         if [ "$USE_SCAN_DAPI" = true ]; then
             if [ "$DRY_RUN" = true ]; then
                 log_msg "  Would swap scan DAPI into Cycle1"
+                log_msg "  Would duplicate Cycle1 as Cycle999 for alignment"
             else
                 swap_scan_dapi_into_cycle1 "$roi_path"
+                duplicate_cycle1_as_cycle999 "$roi_path"
             fi
         fi
         local staging_failed=false
@@ -564,6 +650,7 @@ process_roi() {
         if [ "$USE_SCAN_DAPI" = true ] && [ "$DRY_RUN" = false ]; then
             restore_cycle1_dapi "$roi_path"
             clean_markers_background "$staged_dir"
+            mark_cycle1_markers_removed "$staged_dir"
         fi
         if [ "$staging_failed" = true ]; then
             if [ "$DRY_RUN" = false ]; then
