@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tissue-pseudochannel-gen"
+version = "0.1.0"
+description = "Combine multiplex tissue imaging channels into weighted pseudochannels for improved cell segmentation"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+
+[project.optional-dependencies]
+docs = [
+    "mkdocs>=1.6",
+    "mkdocs-material>=9.5",
+    "mkdocstrings[python]>=0.27",
+    "mike>=2.1",
+    "mkdocs-jupyter>=0.25",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]

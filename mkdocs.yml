@@ -1,0 +1,97 @@
+site_name: Tissue Pseudochannel Generator
+site_url: https://wirthmax.github.io/MTI_Pseudochannel_gen/
+repo_url: https://github.com/WirthMax/MTI_Pseudochannel_gen
+repo_name: WirthMax/MTI_Pseudochannel_gen
+
+theme:
+  name: material
+  palette:
+    - scheme: default
+      primary: teal
+      accent: amber
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+    - scheme: slate
+      primary: teal
+      accent: amber
+      toggle:
+        icon: material/brightness-4
+        name: Switch to light mode
+  features:
+    - content.code.copy
+    - navigation.sections
+    - navigation.expand
+    - navigation.top
+    - toc.follow
+
+extra:
+  version:
+    provider: mike
+
+plugins:
+  - search
+  - mkdocstrings:
+      handlers:
+        python:
+          paths: [src]
+          options:
+            allow_inspection: false
+            docstring_style: google
+            show_source: true
+            show_root_heading: true
+            members_order: source
+  - mkdocs-jupyter:
+      execute: false
+      include_source: true
+
+markdown_extensions:
+  - admonition
+  - pymdownx.details
+  - pymdownx.superfences
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - pymdownx.tabbed:
+      alternate_style: true
+  - toc:
+      permalink: true
+  - pymdownx.snippets
+
+nav:
+  - Home: index.md
+  - Getting Started:
+      - Installation: getting-started/installation.md
+      - Quick Start: getting-started/quickstart.md
+  - User Guide:
+      - Pseudochannels: user-guide/pseudochannel.md
+      - Interactive Explorer: user-guide/explorer.md
+      - Batch Processing: user-guide/batch.md
+      - Tiled Segmentation: user-guide/tiling.md
+      - Downstream Analysis: user-guide/analysis.md
+      - Configuration Reference: user-guide/config.md
+  - MCMICRO Pipeline: mcmicro/index.md
+  - API Reference:
+      - pseudochannel:
+          - Overview: api/pseudochannel/index.md
+          - core: api/pseudochannel/core.md
+          - io: api/pseudochannel/io.md
+          - config: api/pseudochannel/config.md
+          - batch: api/pseudochannel/batch.md
+          - segmentation: api/pseudochannel/segmentation.md
+          - preview: api/pseudochannel/preview.md
+          - widgets: api/pseudochannel/widgets.md
+      - tiling:
+          - Overview: api/tiling/index.md
+          - split: api/tiling/split.md
+          - merge: api/tiling/merge.md
+      - analysis:
+          - Overview: api/analysis/index.md
+          - features: api/analysis/features.md
+          - preprocessing: api/analysis/preprocessing.md
+          - clustering: api/analysis/clustering.md
+          - visualization: api/analysis/visualization.md
+          - export: api/analysis/export.md
+  - Notebooks:
+      - Pseudochannel Explorer: notebooks/pseudochannel_explorer.ipynb
+      - Tiled Segmentation: notebooks/tiled_segmentation.ipynb
+      - Downstream Analysis: notebooks/downstream_analysis.ipynb
