@@ -229,17 +229,21 @@ class PseudochannelExplorer:
             path = Path(nuclear_marker_path)
             if path.is_file():
                 self.nuclear_marker = tifffile.imread(str(path))
+                self._ensure_nuclear_2d()
                 self.nuclear_preview = downsample_image(
                     self.nuclear_marker, self.preview_size
                 )
+                self._match_nuclear_preview_shape()
                 return
 
         # Option B: Auto-detect DAPI from FolderChannels (MACSima mode)
         if isinstance(self.channels, FolderChannels) and self.channels.nuclear_path:
             self.nuclear_marker = tifffile.imread(str(self.channels.nuclear_path))
+            self._ensure_nuclear_2d()
             self.nuclear_preview = downsample_image(
                 self.nuclear_marker, self.preview_size
             )
+            self._match_nuclear_preview_shape()
             return
 
         # Option C: Auto-detect DAPI from OME-TIFF
@@ -257,10 +261,28 @@ class PseudochannelExplorer:
             if name.lower() in dapi_names or "dapi" in name.lower():
                 # Load channel by original index (bypasses exclusion filtering)
                 self.nuclear_marker = self.channels.get_channel_by_index(i)
+                self._ensure_nuclear_2d()
                 self.nuclear_preview = downsample_image(
                     self.nuclear_marker, self.preview_size
                 )
+                self._match_nuclear_preview_shape()
                 return
+
+    def _ensure_nuclear_2d(self) -> None:
+        """Squeeze nuclear marker to 2D (handles extra trailing dimensions)."""
+        if self.nuclear_marker is not None and self.nuclear_marker.ndim > 2:
+            self.nuclear_marker = np.squeeze(self.nuclear_marker)
+        if self.nuclear_marker is not None and self.nuclear_marker.ndim > 2:
+            self.nuclear_marker = self.nuclear_marker[:, :, 0]
+
+    def _match_nuclear_preview_shape(self) -> None:
+        """Crop nuclear preview to match channel preview shape if needed."""
+        if self.nuclear_preview is not None and self.previews:
+            target_shape = next(iter(self.previews.values())).shape[:2]
+            if self.nuclear_preview.shape[:2] != target_shape:
+                h = min(self.nuclear_preview.shape[0], target_shape[0])
+                w = min(self.nuclear_preview.shape[1], target_shape[1])
+                self.nuclear_preview = self.nuclear_preview[:h, :w]
 
     def _normalize_nuclear(self, arr: np.ndarray) -> np.ndarray:
         """Normalize nuclear marker to 0-1 range using percentile stretch.
@@ -720,6 +742,12 @@ class PseudochannelExplorer:
             nuclear = self._normalize_nuclear(
                 self.nuclear_marker[y1:y2:step, x1:x2:step]
             )
+            # Ensure shapes match (nuclear may have different source dimensions)
+            if nuclear.shape != pseudochannel.shape:
+                h = min(nuclear.shape[0], pseudochannel.shape[0])
+                w = min(nuclear.shape[1], pseudochannel.shape[1])
+                nuclear = nuclear[:h, :w]
+                pseudochannel = pseudochannel[:h, :w]
 
         return pseudochannel, nuclear, step
 
@@ -856,6 +884,12 @@ class PseudochannelExplorer:
             # Create RGB composite: pseudo in red+green (yellow), nuclear in blue
             pseudo_norm = pseudochannel
             nuclear_norm = self._normalize_nuclear(self.nuclear_preview)
+            # Ensure shapes match (nuclear may come from different source/dimensions)
+            if nuclear_norm.shape != pseudo_norm.shape:
+                h = min(nuclear_norm.shape[0], pseudo_norm.shape[0])
+                w = min(nuclear_norm.shape[1], pseudo_norm.shape[1])
+                nuclear_norm = nuclear_norm[:h, :w]
+                pseudo_norm = pseudo_norm[:h, :w]
             data = np.stack([pseudo_norm, pseudo_norm, nuclear_norm], axis=-1)
         else:
             data = pseudochannel
