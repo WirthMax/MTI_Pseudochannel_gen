@@ -19,6 +19,8 @@ fi
 DRY_RUN=false
 SKIP_EXPERIMENTS=""
 USE_SCAN_DAPI=false
+USE_BACKGROUND_ALIGN=false
+CLEANUP_BACKGROUND=false
 USE_HIGHEST_EXPOSURE=true
 REFERENCE_MARKER="DAPI"
 EXPERIMENT_FILTER=""
@@ -78,6 +80,17 @@ log_msg() {
 validate_config() {
     local errors=0
 
+    # Cleanup-only mode needs only staging and output dirs
+    if [ "$CLEANUP_BACKGROUND" = true ]; then
+        if [ -z "$STAGING_BASE_DIR" ] || [ -z "$MCMICRO_OUTPUT_BASE" ]; then
+            echo "ERROR: --staging-dir and --output-dir required for --cleanup-background" >&2
+            exit 1
+        fi
+        MCMICRO_WORK_DIR="${MCMICRO_OUTPUT_BASE}/work"
+        LOG_FILE="${MCMICRO_OUTPUT_BASE}/macsima_pipeline_$(date +%Y%m%d_%H%M%S).log"
+        return 0
+    fi
+
     if [ -z "$ROOT_DIR" ]; then
         echo "ERROR: Root directory not set. Use --root-dir or \$MCMICRO_ROOT_DIR" >&2
         errors=$((errors + 1))
@@ -120,10 +133,20 @@ validate_config() {
         errors=$((errors + 1))
     fi
 
+    if [ "$USE_SCAN_DAPI" = true ] && [ "$USE_BACKGROUND_ALIGN" = true ]; then
+        echo "ERROR: --use-scan-dapi and --use-background-align are mutually exclusive" >&2
+        errors=$((errors + 1))
+    fi
+
     if [ $errors -gt 0 ]; then
         echo "" >&2
         echo "Use --help for usage information" >&2
         exit 1
+    fi
+
+    # Override reference marker for background alignment
+    if [ "$USE_BACKGROUND_ALIGN" = true ]; then
+        REFERENCE_MARKER="BGREF"
     fi
 
     # Derive work directory
@@ -320,6 +343,214 @@ duplicate_cycle1_as_cycle999() {
     return 0
 }
 
+inject_background_ref() {
+    local roi_path="$1"
+    local scan_dir="${roi_path}/3_Scan2"
+    local backup_dir="${roi_path}/.bgref_backup"
+
+    # Find the Cycle1 directory
+    local cycle1_dir
+    cycle1_dir=$(find "$roi_path" -maxdepth 1 -type d -name '*_Cycle1' | head -1)
+
+    if [ ! -d "$scan_dir" ]; then
+        log_error "3_Scan2 directory not found in $roi_path — cannot inject background ref"
+        return 1
+    fi
+
+    if [ -z "$cycle1_dir" ]; then
+        log_error "No *_Cycle1 directory found in $roi_path — cannot inject background ref"
+        return 1
+    fi
+
+    # If stale backup exists (interrupted previous run), restore first
+    if [ -d "$backup_dir" ]; then
+        log_warning "Found stale .bgref_backup in $roi_path — restoring before re-injecting"
+        restore_background_ref "$roi_path"
+    fi
+
+    mkdir -p "$backup_dir"
+
+    #--- Cycle1: Inject highest-exposure PE from 3_Scan2 as BGREF ---
+
+    # Find all PE files in 3_Scan2
+    local pe_files=()
+    while IFS= read -r f; do
+        pe_files+=("$f")
+    done < <(find "$scan_dir" -maxdepth 1 -name '*_D-PE_*.tif' -type f 2>/dev/null)
+
+    if [ ${#pe_files[@]} -eq 0 ]; then
+        log_error "No PE files found in $scan_dir — cannot inject background ref"
+        rmdir "$backup_dir" 2>/dev/null || true
+        return 1
+    fi
+
+    # Determine highest exposure among PE files
+    local highest_exp="0"
+    for f in "${pe_files[@]}"; do
+        local exp_val
+        exp_val=$(basename "$f" | grep -oP 'EXP-\K[0-9.]+')
+        if [ -n "$exp_val" ]; then
+            if awk "BEGIN {exit !($exp_val > $highest_exp)}"; then
+                highest_exp="$exp_val"
+            fi
+        fi
+    done
+
+    # Copy highest-exposure PE tiles into Cycle1 as BGREF
+    local injected_cycle1=0
+    for f in "${pe_files[@]}"; do
+        local bname
+        bname=$(basename "$f")
+        # Only use the highest exposure tiles
+        local exp_val
+        exp_val=$(echo "$bname" | grep -oP 'EXP-\K[0-9.]+')
+        if [ "$exp_val" != "$highest_exp" ]; then
+            continue
+        fi
+        # Extract ROI, field, R, W identifiers from the scan filename
+        local r_id w_id roi_id f_id
+        r_id=$(echo "$bname" | grep -oP 'R-\K[0-9]+')
+        w_id=$(echo "$bname" | grep -oP 'W-\K[A-Z][0-9]+')
+        roi_id=$(echo "$bname" | grep -oP 'ROI-\K[0-9]+')
+        f_id=$(echo "$bname" | grep -oP 'F-\K[0-9]+')
+        # Build the BGREF filename for Cycle1
+        local new_name="CYC-001_SCN-002_ST-S_R-${r_id}_W-${w_id}_ROI-${roi_id}_F-${f_id}_A-BGREF_C-Reference_D-PE_EXP-${highest_exp}.tif"
+        cp "$f" "$cycle1_dir/$new_name"
+        injected_cycle1=$((injected_cycle1 + 1))
+    done
+
+    log_info "Injected $injected_cycle1 BGREF tiles into Cycle1 from 3_Scan2 PE (EXP-${highest_exp})"
+
+    # Move Cycle1 ST-B (bleach) files to backup to prevent staging issues
+    local bleach_moved=0
+    for bleach_file in "$cycle1_dir"/*_ST-B_*.tif; do
+        [ -f "$bleach_file" ] || continue
+        mv "$bleach_file" "$backup_dir/"
+        bleach_moved=$((bleach_moved + 1))
+    done
+    if [ $bleach_moved -gt 0 ]; then
+        log_info "Moved $bleach_moved Cycle1 bleach (ST-B) files to .bgref_backup"
+    fi
+
+    #--- Cycle999 + other cycles: Inject highest-exposure ST-B as BGREF ---
+
+    local total_injected_other=0
+    for cycle_dir in "$roi_path"/*_Cycle*/; do
+        [ -d "$cycle_dir" ] || continue
+        local cycle_basename
+        cycle_basename=$(basename "$cycle_dir")
+        # Skip Cycle1 (already handled above)
+        if [[ "$cycle_basename" == *_Cycle1 ]]; then
+            continue
+        fi
+        # Extract cycle number from directory name (e.g. "999" from "999_Cycle999")
+        local cycle_num
+        cycle_num=$(echo "$cycle_basename" | grep -oP 'Cycle\K[0-9]+')
+        local cyc_padded
+        cyc_padded=$(printf '%03d' "$cycle_num")
+
+        # Find ST-B files with filter priority: PE > FITC > APC
+        local chosen_filter=""
+        local stb_files=()
+        for filter_name in PE FITC APC; do
+            local candidates=()
+            while IFS= read -r f; do
+                candidates+=("$f")
+            done < <(find "$cycle_dir" -maxdepth 1 -name "*_ST-B_*_D-${filter_name}_*.tif" -type f 2>/dev/null)
+            if [ ${#candidates[@]} -gt 0 ]; then
+                chosen_filter="$filter_name"
+                stb_files=("${candidates[@]}")
+                break
+            fi
+        done
+
+        if [ -z "$chosen_filter" ]; then
+            log_warning "No suitable ST-B files found in $cycle_dir — skipping BGREF injection for this cycle"
+            continue
+        fi
+
+        # Determine highest exposure among chosen filter's ST-B files
+        local he_stb="0"
+        for f in "${stb_files[@]}"; do
+            local exp_val
+            exp_val=$(basename "$f" | grep -oP 'EXP-\K[0-9.]+')
+            if [ -n "$exp_val" ]; then
+                if awk "BEGIN {exit !($exp_val > $he_stb)}"; then
+                    he_stb="$exp_val"
+                fi
+            fi
+        done
+
+        # Copy highest-exposure ST-B tiles as BGREF
+        for f in "${stb_files[@]}"; do
+            local bname
+            bname=$(basename "$f")
+            local exp_val
+            exp_val=$(echo "$bname" | grep -oP 'EXP-\K[0-9.]+')
+            if [ "$exp_val" != "$he_stb" ]; then
+                continue
+            fi
+            local r_id w_id roi_id f_id
+            r_id=$(echo "$bname" | grep -oP 'R-\K[0-9]+')
+            w_id=$(echo "$bname" | grep -oP 'W-\K[A-Z][0-9]+')
+            roi_id=$(echo "$bname" | grep -oP 'ROI-\K[0-9]+')
+            f_id=$(echo "$bname" | grep -oP 'F-\K[0-9]+')
+            local new_name="CYC-${cyc_padded}_SCN-002_ST-S_R-${r_id}_W-${w_id}_ROI-${roi_id}_F-${f_id}_A-BGREF_C-Reference_D-${chosen_filter}_EXP-${he_stb}.tif"
+            cp "$f" "$cycle_dir/$new_name"
+            total_injected_other=$((total_injected_other + 1))
+        done
+    done
+
+    log_info "Injected $total_injected_other BGREF tiles into other cycles (Cycle999 + remaining)"
+    return 0
+}
+
+restore_background_ref() {
+    local roi_path="$1"
+    local backup_dir="${roi_path}/.bgref_backup"
+
+    # Remove all injected BGREF files from all cycle directories
+    local removed=0
+    for cycle_dir in "$roi_path"/*_Cycle*/; do
+        [ -d "$cycle_dir" ] || continue
+        for bgref_file in "$cycle_dir"/*_A-BGREF_C-Reference_*.tif; do
+            [ -f "$bgref_file" ] || continue
+            rm "$bgref_file"
+            removed=$((removed + 1))
+        done
+    done
+    if [ $removed -gt 0 ]; then
+        log_info "Removed $removed injected BGREF files from cycle directories"
+    fi
+
+    # Restore Cycle1 ST-B files from backup
+    if [ -d "$backup_dir" ]; then
+        local cycle1_dir
+        cycle1_dir=$(find "$roi_path" -maxdepth 1 -type d -name '*_Cycle1' | head -1)
+        if [ -n "$cycle1_dir" ]; then
+            local restored=0
+            for backup_file in "$backup_dir"/*.tif; do
+                [ -f "$backup_file" ] || continue
+                mv "$backup_file" "$cycle1_dir/"
+                restored=$((restored + 1))
+            done
+            log_info "Restored $restored Cycle1 bleach files from .bgref_backup"
+        else
+            log_error "Cannot restore bleach files: no *_Cycle1 directory found in $roi_path"
+        fi
+        rm -rf "$backup_dir"
+    fi
+
+    # Remove Cycle999 directory
+    local cycle999_dir="${roi_path}/999_Cycle999"
+    if [ -d "$cycle999_dir" ]; then
+        rm -rf "$cycle999_dir"
+        log_info "Removed Cycle999 duplicate directory ($roi_path)"
+    fi
+
+    return 0
+}
+
 restore_cycle1_dapi() {
     local roi_path="$1"
     local backup_dir="${roi_path}/.dapi_backup"
@@ -425,6 +656,83 @@ if marked > 0:
     print(f'Marked {marked} channels as remove=TRUE in {path} (Cycle1 markers + Cycle999 DAPI)')
 " "$markers_csv" 2>&1 | while read -r line; do log_info "$line"; done
     done < <(find "$staged_dir" -name "markers.csv" -type f)
+}
+
+mark_background_markers_removed() {
+    local staged_dir="$1"
+
+    local markers_csv
+    while IFS= read -r markers_csv; do
+        [ -f "$markers_csv" ] || continue
+        python3 -c "
+import csv, sys
+
+path = sys.argv[1]
+with open(path) as f:
+    reader = csv.DictReader(f)
+    fieldnames = reader.fieldnames
+    rows = list(reader)
+
+marked = 0
+for r in rows:
+    cycle = int(r.get('cycle_number', 0))
+    marker = r.get('marker_name', '')
+    # All BGREF channels are alignment helpers — remove them
+    if marker == 'BGREF':
+        r['remove'] = 'TRUE'
+        marked += 1
+    # Cycle 1 non-DAPI markers are misaligned (acquired at original positions, not Scan positions)
+    elif cycle == 1 and marker != 'DAPI':
+        r['remove'] = 'TRUE'
+        marked += 1
+    # Cycle 999 DAPI is the original bad-quality DAPI — only needed for alignment
+    elif cycle == 999 and marker == 'DAPI':
+        r['remove'] = 'TRUE'
+        marked += 1
+
+if marked > 0:
+    with open(path, 'w', newline='') as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+    print(f'Marked {marked} channels as remove=TRUE in {path} (BGREF + Cycle1 markers + Cycle999 DAPI)')
+" "$markers_csv" 2>&1 | while read -r line; do log_info "$line"; done
+    done < <(find "$staged_dir" -name "markers.csv" -type f)
+}
+
+cleanup_background_markers() {
+    local count=0
+    local markers_csv
+    while IFS= read -r markers_csv; do
+        [ -f "$markers_csv" ] || continue
+        python3 -c "
+import csv, sys
+
+path = sys.argv[1]
+with open(path) as f:
+    reader = csv.DictReader(f)
+    fieldnames = reader.fieldnames
+    rows = list(reader)
+
+marked = 0
+for r in rows:
+    marker = r.get('marker_name', '')
+    if marker == 'BGREF' and r.get('remove', '').upper() != 'TRUE':
+        r['remove'] = 'TRUE'
+        marked += 1
+
+if marked > 0:
+    with open(path, 'w', newline='') as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+    print(f'Marked {marked} BGREF channels as remove=TRUE in {path}')
+else:
+    print(f'No unmarked BGREF channels found in {path}')
+" "$markers_csv" 2>&1 | while read -r line; do log_info "$line"; done
+        count=$((count + 1))
+    done < <(find "$STAGING_BASE_DIR" -name "markers.csv" -type f)
+    log_info "Processed $count markers.csv files for BGREF cleanup"
 }
 
 # Return the highest-exposure directory under base_dir, or base_dir itself.
@@ -643,6 +951,15 @@ process_roi() {
                 duplicate_cycle1_as_cycle999 "$roi_path"
             fi
         fi
+        if [ "$USE_BACKGROUND_ALIGN" = true ]; then
+            if [ "$DRY_RUN" = true ]; then
+                log_msg "  Would duplicate Cycle1 as Cycle999 for alignment"
+                log_msg "  Would inject background reference (BGREF) into all cycles"
+            else
+                duplicate_cycle1_as_cycle999 "$roi_path"
+                inject_background_ref "$roi_path"
+            fi
+        fi
         local staging_failed=false
         if ! stage_roi "$roi_path" "$staged_dir" "$roi_name"; then
             staging_failed=true
@@ -651,6 +968,11 @@ process_roi() {
             restore_cycle1_dapi "$roi_path"
             clean_markers_background "$staged_dir"
             mark_cycle1_markers_removed "$staged_dir"
+        fi
+        if [ "$USE_BACKGROUND_ALIGN" = true ] && [ "$DRY_RUN" = false ]; then
+            restore_background_ref "$roi_path"
+            clean_markers_background "$staged_dir"
+            mark_background_markers_removed "$staged_dir"
         fi
         if [ "$staging_failed" = true ]; then
             if [ "$DRY_RUN" = false ]; then
@@ -787,6 +1109,9 @@ print_config_summary() {
     if [ "$USE_SCAN_DAPI" = true ]; then
         log_msg "Swap scan DAPI into Cycle1: YES"
     fi
+    if [ "$USE_BACKGROUND_ALIGN" = true ]; then
+        log_msg "Background-based alignment: YES (using BGREF from ST-B/PE autofluorescence)"
+    fi
     if [ "$USE_HIGHEST_EXPOSURE" = true ]; then
         log_msg "Using highest exposure only (-he for staging, highest folder for MCMICRO)"
     else
@@ -840,6 +1165,14 @@ print_final_summary() {
 
 main() {
     validate_config
+
+    # Standalone BGREF cleanup mode — mark and exit
+    if [ "$CLEANUP_BACKGROUND" = true ]; then
+        mkdir -p "$MCMICRO_OUTPUT_BASE"
+        log_info "Running standalone BGREF cleanup on $STAGING_BASE_DIR"
+        cleanup_background_markers
+        exit 0
+    fi
 
     if [ "$DRY_RUN" = false ]; then
         mkdir -p "$STAGING_BASE_DIR"
@@ -924,6 +1257,14 @@ while [[ $# -gt 0 ]]; do
             USE_SCAN_DAPI=true
             shift
             ;;
+        --use-background-align)
+            USE_BACKGROUND_ALIGN=true
+            shift
+            ;;
+        --cleanup-background)
+            CLEANUP_BACKGROUND=true
+            shift
+            ;;
         --highest-exposure-only|-he)
             USE_HIGHEST_EXPOSURE=true
             shift
@@ -963,6 +1304,8 @@ Optional arguments:
   --skip-experiments <list>   Same as --skip-exp
   --experiment-filter REGEX   Only process experiments matching REGEX (bash regex)
   --use-scan-dapi             Swap scan DAPI tiles into Cycle1 before staging (backs up originals, restores after)
+  --use-background-align      Align cycles using ST-B autofluorescence instead of DAPI (mutually exclusive with --use-scan-dapi)
+  --cleanup-background        Standalone: mark BGREF as remove=TRUE in all staged markers.csv (only needs --staging-dir and --output-dir)
   --highest-exposure-only     Use only highest exposure in staging (-he flag)
   -he                         Same as --highest-exposure-only
   --cleanup-staged            Delete staged raw data after successful processing
