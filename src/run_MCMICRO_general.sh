@@ -388,7 +388,7 @@ inject_background_ref() {
     local highest_exp="0"
     for f in "${pe_files[@]}"; do
         local exp_val
-        exp_val=$(basename "$f" | grep -oP 'EXP-\K[0-9.]+')
+        exp_val=$(basename "$f" | grep -oP 'EXP-\K[0-9]+(\.[0-9]+)?')
         if [ -n "$exp_val" ]; then
             if awk "BEGIN {exit !($exp_val > $highest_exp)}"; then
                 highest_exp="$exp_val"
@@ -403,7 +403,7 @@ inject_background_ref() {
         bname=$(basename "$f")
         # Only use the highest exposure tiles
         local exp_val
-        exp_val=$(echo "$bname" | grep -oP 'EXP-\K[0-9.]+')
+        exp_val=$(echo "$bname" | grep -oP 'EXP-\K[0-9]+(\.[0-9]+)?')
         if [ "$exp_val" != "$highest_exp" ]; then
             continue
         fi
@@ -420,17 +420,6 @@ inject_background_ref() {
     done
 
     log_info "Injected $injected_cycle1 BGREF tiles into Cycle1 from 3_Scan2 PE (EXP-${highest_exp})"
-
-    # Move Cycle1 ST-B (bleach) files to backup to prevent staging issues
-    local bleach_moved=0
-    for bleach_file in "$cycle1_dir"/*_ST-B_*.tif; do
-        [ -f "$bleach_file" ] || continue
-        mv "$bleach_file" "$backup_dir/"
-        bleach_moved=$((bleach_moved + 1))
-    done
-    if [ $bleach_moved -gt 0 ]; then
-        log_info "Moved $bleach_moved Cycle1 bleach (ST-B) files to .bgref_backup"
-    fi
 
     #--- Cycle999 + other cycles: Inject highest-exposure ST-B as BGREF ---
 
@@ -449,6 +438,13 @@ inject_background_ref() {
         local cyc_padded
         cyc_padded=$(printf '%03d' "$cycle_num")
 
+        # Determine where to search for ST-B files
+        # Cycle999 is a duplicate of Cycle1 stain files and has no ST-B; use Cycle1's
+        local stb_search_dir="$cycle_dir"
+        if [[ "$cycle_basename" == *_Cycle999 ]]; then
+            stb_search_dir="$cycle1_dir"
+        fi
+
         # Find ST-B files with filter priority: PE > FITC > APC
         local chosen_filter=""
         local stb_files=()
@@ -456,7 +452,7 @@ inject_background_ref() {
             local candidates=()
             while IFS= read -r f; do
                 candidates+=("$f")
-            done < <(find "$cycle_dir" -maxdepth 1 -name "*_ST-B_*_D-${filter_name}_*.tif" -type f 2>/dev/null)
+            done < <(find "$stb_search_dir" -maxdepth 1 -name "*_ST-B_*_D-${filter_name}_*.tif" -type f 2>/dev/null)
             if [ ${#candidates[@]} -gt 0 ]; then
                 chosen_filter="$filter_name"
                 stb_files=("${candidates[@]}")
@@ -473,7 +469,7 @@ inject_background_ref() {
         local he_stb="0"
         for f in "${stb_files[@]}"; do
             local exp_val
-            exp_val=$(basename "$f" | grep -oP 'EXP-\K[0-9.]+')
+            exp_val=$(basename "$f" | grep -oP 'EXP-\K[0-9]+(\.[0-9]+)?')
             if [ -n "$exp_val" ]; then
                 if awk "BEGIN {exit !($exp_val > $he_stb)}"; then
                     he_stb="$exp_val"
@@ -486,7 +482,7 @@ inject_background_ref() {
             local bname
             bname=$(basename "$f")
             local exp_val
-            exp_val=$(echo "$bname" | grep -oP 'EXP-\K[0-9.]+')
+            exp_val=$(echo "$bname" | grep -oP 'EXP-\K[0-9]+(\.[0-9]+)?')
             if [ "$exp_val" != "$he_stb" ]; then
                 continue
             fi
@@ -502,6 +498,19 @@ inject_background_ref() {
     done
 
     log_info "Injected $total_injected_other BGREF tiles into other cycles (Cycle999 + remaining)"
+
+    # Move Cycle1 ST-B (bleach) files to backup to prevent staging issues
+    # Done AFTER the other-cycles loop so Cycle999 can still find Cycle1's ST-B files
+    local bleach_moved=0
+    for bleach_file in "$cycle1_dir"/*_ST-B_*.tif; do
+        [ -f "$bleach_file" ] || continue
+        mv "$bleach_file" "$backup_dir/"
+        bleach_moved=$((bleach_moved + 1))
+    done
+    if [ $bleach_moved -gt 0 ]; then
+        log_info "Moved $bleach_moved Cycle1 bleach (ST-B) files to .bgref_backup"
+    fi
+
     return 0
 }
 
