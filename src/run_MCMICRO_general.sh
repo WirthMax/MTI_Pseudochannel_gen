@@ -416,6 +416,9 @@ inject_background_ref() {
         # Build the BGREF filename for Cycle1
         local new_name="CYC-001_SCN-002_ST-S_R-${r_id}_W-${w_id}_ROI-${roi_id}_F-${f_id}_A-BGREF_C-Reference_D-PE_EXP-${highest_exp}.tif"
         cp "$f" "$cycle1_dir/$new_name"
+        # Also create ST-B counterpart (SCN-001) so macsima2mc can pair stain+bleach
+        local new_name_b="CYC-001_SCN-001_ST-B_R-${r_id}_W-${w_id}_ROI-${roi_id}_F-${f_id}_A-BGREF_C-Reference_D-PE_EXP-${highest_exp}.tif"
+        cp "$f" "$cycle1_dir/$new_name_b"
         injected_cycle1=$((injected_cycle1 + 1))
     done
 
@@ -493,6 +496,9 @@ inject_background_ref() {
             f_id=$(echo "$bname" | grep -oP 'F-\K[0-9]+')
             local new_name="CYC-${cyc_padded}_SCN-002_ST-S_R-${r_id}_W-${w_id}_ROI-${roi_id}_F-${f_id}_A-BGREF_C-Reference_D-${chosen_filter}_EXP-${he_stb}.tif"
             cp "$f" "$cycle_dir/$new_name"
+            # Also create ST-B counterpart (SCN-001) so macsima2mc can pair stain+bleach
+            local new_name_b="CYC-${cyc_padded}_SCN-001_ST-B_R-${r_id}_W-${w_id}_ROI-${roi_id}_F-${f_id}_A-BGREF_C-Reference_D-${chosen_filter}_EXP-${he_stb}.tif"
+            cp "$f" "$cycle_dir/$new_name_b"
             total_injected_other=$((total_injected_other + 1))
         done
     done
@@ -504,6 +510,8 @@ inject_background_ref() {
     local bleach_moved=0
     for bleach_file in "$cycle1_dir"/*_ST-B_*.tif; do
         [ -f "$bleach_file" ] || continue
+        # Don't move injected BGREF ST-B files — they need to stay for macsima2mc pairing
+        [[ "$(basename "$bleach_file")" == *_A-BGREF_* ]] && continue
         mv "$bleach_file" "$backup_dir/"
         bleach_moved=$((bleach_moved + 1))
     done
