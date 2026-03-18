@@ -26,6 +26,7 @@ REFERENCE_MARKER="DAPI"
 EXPERIMENT_FILTER=""
 CLEANUP_STAGED=false
 RECOMPUTE=false
+KEEP_BACKGROUND_CHANNELS=false
 
 # Config paths (set via CLI flags or environment variables)
 ROOT_DIR="${MCMICRO_ROOT_DIR:-}"
@@ -1030,7 +1031,11 @@ process_roi() {
             restore_dapi_for_bgref "$roi_path"
             restore_background_ref "$roi_path"
             clean_markers_background "$staged_dir"
-            mark_background_markers_removed "$staged_dir"
+            if [ "$KEEP_BACKGROUND_CHANNELS" = true ]; then
+                mark_cycle1_markers_removed "$staged_dir"
+            else
+                mark_background_markers_removed "$staged_dir"
+            fi
         fi
         if [ "$staging_failed" = true ]; then
             if [ "$DRY_RUN" = false ]; then
@@ -1323,6 +1328,10 @@ while [[ $# -gt 0 ]]; do
             CLEANUP_BACKGROUND=true
             shift
             ;;
+        --keep-background-channels)
+            KEEP_BACKGROUND_CHANNELS=true
+            shift
+            ;;
         --highest-exposure-only|-he)
             USE_HIGHEST_EXPOSURE=true
             shift
@@ -1364,6 +1373,7 @@ Optional arguments:
   --use-scan-dapi             Swap scan DAPI tiles into Cycle1 before staging (backs up originals, restores after)
   --use-background-align      Align cycles using ST-B autofluorescence instead of DAPI (mutually exclusive with --use-scan-dapi)
   --cleanup-background        Standalone: mark BGREF as remove=TRUE in all staged markers.csv (only needs --staging-dir and --output-dir)
+  --keep-background-channels  Keep BGREF alignment channels in the final stacked TIF (use with --use-background-align)
   --highest-exposure-only     Use only highest exposure in staging (-he flag)
   -he                         Same as --highest-exposure-only
   --cleanup-staged            Delete staged raw data after successful processing
