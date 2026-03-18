@@ -568,6 +568,45 @@ restore_background_ref() {
     return 0
 }
 
+fix_dapi_for_bgref() {
+    local roi_path="$1"
+    local fixed=0
+    for cycle_dir in "$roi_path"/*_Cycle*/; do
+        [ -d "$cycle_dir" ] || continue
+        for f in "$cycle_dir"/*_D-DAPI_*.tif; do
+            [ -f "$f" ] || continue
+            local bname
+            bname=$(basename "$f")
+            [[ "$bname" == *_A-*_C-* ]] && continue
+            local new_name="${bname/_D-DAPI_/_A-DAPI_C-_D-DAPI_}"
+            mv "$f" "$(dirname "$f")/$new_name"
+            fixed=$((fixed + 1))
+        done
+    done
+    if [ $fixed -gt 0 ]; then
+        log_info "Renamed $fixed DAPI files (added _A-DAPI_C-_) for BGREF compatibility"
+    fi
+}
+
+restore_dapi_for_bgref() {
+    local roi_path="$1"
+    local restored=0
+    for cycle_dir in "$roi_path"/*_Cycle*/; do
+        [ -d "$cycle_dir" ] || continue
+        for f in "$cycle_dir"/*_A-DAPI_C-_D-DAPI_*.tif; do
+            [ -f "$f" ] || continue
+            local bname
+            bname=$(basename "$f")
+            local new_name="${bname/_A-DAPI_C-_D-DAPI_/_D-DAPI_}"
+            mv "$f" "$(dirname "$f")/$new_name"
+            restored=$((restored + 1))
+        done
+    done
+    if [ $restored -gt 0 ]; then
+        log_info "Restored $restored DAPI filenames to original format"
+    fi
+}
+
 restore_cycle1_dapi() {
     local roi_path="$1"
     local backup_dir="${roi_path}/.dapi_backup"
@@ -975,6 +1014,7 @@ process_roi() {
             else
                 duplicate_cycle1_as_cycle999 "$roi_path"
                 inject_background_ref "$roi_path"
+                fix_dapi_for_bgref "$roi_path"
             fi
         fi
         local staging_failed=false
@@ -987,6 +1027,7 @@ process_roi() {
             mark_cycle1_markers_removed "$staged_dir"
         fi
         if [ "$USE_BACKGROUND_ALIGN" = true ] && [ "$DRY_RUN" = false ]; then
+            restore_dapi_for_bgref "$roi_path"
             restore_background_ref "$roi_path"
             clean_markers_background "$staged_dir"
             mark_background_markers_removed "$staged_dir"
