@@ -677,6 +677,37 @@ if cleaned > 0:
     done < <(find "$staged_dir" -name "markers.csv" -type f)
 }
 
+clear_bgref_background_refs() {
+    local staged_dir="$1"
+
+    local markers_csv
+    while IFS= read -r markers_csv; do
+        [ -f "$markers_csv" ] || continue
+        python3 -c "
+import csv, sys
+
+path = sys.argv[1]
+with open(path) as f:
+    reader = csv.DictReader(f)
+    fieldnames = reader.fieldnames
+    rows = list(reader)
+
+cleared = 0
+for r in rows:
+    if r.get('marker_name') == 'BGREF' and r.get('background', ''):
+        r['background'] = ''
+        cleared += 1
+
+if cleared > 0:
+    with open(path, 'w', newline='') as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+    print(f'Cleared background references from {cleared} BGREF channels in {path}')
+" "$markers_csv" 2>&1 | while read -r line; do log_info "$line"; done
+    done < <(find "$staged_dir" -name "markers.csv" -type f)
+}
+
 mark_cycle1_markers_removed() {
     local staged_dir="$1"
 
@@ -1031,6 +1062,7 @@ process_roi() {
             restore_dapi_for_bgref "$roi_path"
             restore_background_ref "$roi_path"
             clean_markers_background "$staged_dir"
+            clear_bgref_background_refs "$staged_dir"
             if [ "$KEEP_BACKGROUND_CHANNELS" = true ]; then
                 mark_cycle1_markers_removed "$staged_dir"
             else
