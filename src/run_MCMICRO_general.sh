@@ -299,10 +299,6 @@ swap_scan_dapi_into_cycle1() {
         bleach_moved=$((bleach_moved + 1))
     done
 
-    if [ $bleach_moved -gt 0 ]; then
-        log_info "Moved $bleach_moved bleach (ST-B) files out of $cycle1_dir for staging"
-    fi
-
     return 0
 }
 
@@ -423,8 +419,6 @@ inject_background_ref() {
         injected_cycle1=$((injected_cycle1 + 1))
     done
 
-    log_info "Injected $injected_cycle1 BGREF tiles into Cycle1 from 3_Scan2 PE (EXP-${highest_exp})"
-
     #--- Cycle999 + other cycles: Inject highest-exposure ST-B as BGREF ---
 
     local total_injected_other=0
@@ -504,8 +498,6 @@ inject_background_ref() {
         done
     done
 
-    log_info "Injected $total_injected_other BGREF tiles into other cycles (Cycle999 + remaining)"
-
     # Move Cycle1 ST-B (bleach) files to backup to prevent staging issues
     # Done AFTER the other-cycles loop so Cycle999 can still find Cycle1's ST-B files
     local bleach_moved=0
@@ -516,10 +508,6 @@ inject_background_ref() {
         mv "$bleach_file" "$backup_dir/"
         bleach_moved=$((bleach_moved + 1))
     done
-    if [ $bleach_moved -gt 0 ]; then
-        log_info "Moved $bleach_moved Cycle1 bleach (ST-B) files to .bgref_backup"
-    fi
-
     return 0
 }
 
@@ -537,10 +525,6 @@ restore_background_ref() {
             removed=$((removed + 1))
         done
     done
-    if [ $removed -gt 0 ]; then
-        log_info "Removed $removed injected BGREF files from cycle directories"
-    fi
-
     # Restore Cycle1 ST-B files from backup
     if [ -d "$backup_dir" ]; then
         local cycle1_dir
@@ -552,7 +536,6 @@ restore_background_ref() {
                 mv "$backup_file" "$cycle1_dir/"
                 restored=$((restored + 1))
             done
-            log_info "Restored $restored Cycle1 bleach files from .bgref_backup"
         else
             log_error "Cannot restore bleach files: no *_Cycle1 directory found in $roi_path"
         fi
@@ -563,7 +546,6 @@ restore_background_ref() {
     local cycle999_dir="${roi_path}/999_Cycle999"
     if [ -d "$cycle999_dir" ]; then
         rm -rf "$cycle999_dir"
-        log_info "Removed Cycle999 duplicate directory ($roi_path)"
     fi
 
     return 0
@@ -584,9 +566,6 @@ fix_dapi_for_bgref() {
             fixed=$((fixed + 1))
         done
     done
-    if [ $fixed -gt 0 ]; then
-        log_info "Renamed $fixed DAPI files (added _A-DAPI_C-_) for BGREF compatibility"
-    fi
 }
 
 restore_dapi_for_bgref() {
@@ -603,9 +582,6 @@ restore_dapi_for_bgref() {
             restored=$((restored + 1))
         done
     done
-    if [ $restored -gt 0 ]; then
-        log_info "Restored $restored DAPI filenames to original format"
-    fi
 }
 
 restore_cycle1_dapi() {
@@ -632,13 +608,11 @@ restore_cycle1_dapi() {
     done
 
     rm -rf "$backup_dir"
-    log_info "Restored $restored files to Cycle1 ($roi_path)"
 
     # Remove the fake Cycle999 directory if it exists (created by duplicate_cycle1_as_cycle999)
     local cycle999_dir="${roi_path}/999_Cycle999"
     if [ -d "$cycle999_dir" ]; then
         rm -rf "$cycle999_dir"
-        log_info "Removed Cycle999 duplicate directory ($roi_path)"
     fi
 
     return 0
@@ -672,7 +646,6 @@ if cleaned > 0:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerows(rows)
-    print(f'Cleared {cleaned} invalid background references in {path}')
 " "$markers_csv" 2>&1 | while read -r line; do log_info "$line"; done
     done < <(find "$staged_dir" -name "markers.csv" -type f)
 }
@@ -703,7 +676,6 @@ if cleared > 0:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerows(rows)
-    print(f'Cleared background references from {cleared} BGREF channels in {path}')
 " "$markers_csv" 2>&1 | while read -r line; do log_info "$line"; done
     done < <(find "$staged_dir" -name "markers.csv" -type f)
 }
@@ -741,7 +713,6 @@ if marked > 0:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerows(rows)
-    print(f'Marked {marked} channels as remove=TRUE in {path} (Cycle1 markers + Cycle999 DAPI)')
 " "$markers_csv" 2>&1 | while read -r line; do log_info "$line"; done
     done < <(find "$staged_dir" -name "markers.csv" -type f)
 }
@@ -783,7 +754,6 @@ if marked > 0:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerows(rows)
-    print(f'Marked {marked} channels as remove=TRUE in {path} (BGREF + Cycle1 markers + Cycle999 DAPI)')
 " "$markers_csv" 2>&1 | while read -r line; do log_info "$line"; done
     done < <(find "$staged_dir" -name "markers.csv" -type f)
 }
@@ -814,13 +784,9 @@ if marked > 0:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerows(rows)
-    print(f'Marked {marked} BGREF channels as remove=TRUE in {path}')
-else:
-    print(f'No unmarked BGREF channels found in {path}')
 " "$markers_csv" 2>&1 | while read -r line; do log_info "$line"; done
         count=$((count + 1))
     done < <(find "$STAGING_BASE_DIR" -name "markers.csv" -type f)
-    log_info "Processed $count markers.csv files for BGREF cleanup"
 }
 
 # Return the highest-exposure directory under base_dir, or base_dir itself.
@@ -884,7 +850,6 @@ stage_roi() {
         cycle_folder=$(basename "$cycle")
 
         cycle_count=$((cycle_count + 1))
-        log_info "  Processing cycle: $cycle_folder"
 
         local he_flag=""
         if [ "$USE_HIGHEST_EXPOSURE" = true ]; then
@@ -904,7 +869,7 @@ stage_roi() {
             -o "/media/1" \
             -ic \
             $he_flag >> "$LOG_FILE" 2>&1; then
-            log_info "  Cycle $cycle_folder staged successfully"
+            :
         else
             log_error "  Failed to stage cycle $cycle_folder"
             return 1
