@@ -417,9 +417,8 @@ inject_background_ref() {
         # Build the BGREF filename for Cycle1
         local new_name="CYC-001_SCN-002_ST-S_R-${r_id}_W-${w_id}_ROI-${roi_id}_F-${f_id}_A-BGREF_C-Reference_D-BGREF_EXP-${highest_exp}.tif"
         cp "$f" "$cycle1_dir/$new_name"
-        # Also create ST-B counterpart (SCN-001) so macsima2mc can pair stain+bleach
-        local new_name_b="CYC-001_SCN-001_ST-B_R-${r_id}_W-${w_id}_ROI-${roi_id}_F-${f_id}_A-BGREF_C-Reference_D-BGREF_EXP-${highest_exp}.tif"
-        cp "$f" "$cycle1_dir/$new_name_b"
+        # NOTE: No ST-B counterpart for BGREF — reduces ASHLAR rounds by avoiding
+        # redundant src-B OME-TIFFs. If macsima2mc requires paired S/B, restore this.
         injected_cycle1=$((injected_cycle1 + 1))
     done
 
@@ -497,9 +496,8 @@ inject_background_ref() {
             f_id=$(echo "$bname" | grep -oP 'F-\K[0-9]+')
             local new_name="CYC-${cyc_padded}_SCN-002_ST-S_R-${r_id}_W-${w_id}_ROI-${roi_id}_F-${f_id}_A-BGREF_C-Reference_D-BGREF_EXP-${he_stb}.tif"
             cp "$f" "$cycle_dir/$new_name"
-            # Also create ST-B counterpart (SCN-001) so macsima2mc can pair stain+bleach
-            local new_name_b="CYC-${cyc_padded}_SCN-001_ST-B_R-${r_id}_W-${w_id}_ROI-${roi_id}_F-${f_id}_A-BGREF_C-Reference_D-BGREF_EXP-${he_stb}.tif"
-            cp "$f" "$cycle_dir/$new_name_b"
+            # NOTE: No ST-B counterpart for BGREF — reduces ASHLAR rounds by avoiding
+            # redundant src-B OME-TIFFs. If macsima2mc requires paired S/B, restore this.
             total_injected_other=$((total_injected_other + 1))
         done
     done
@@ -511,8 +509,7 @@ inject_background_ref() {
     local bleach_moved=0
     for bleach_file in "$cycle1_dir"/*_ST-B_*.tif; do
         [ -f "$bleach_file" ] || continue
-        # Don't move injected BGREF ST-B files — they need to stay for macsima2mc pairing
-        [[ "$(basename "$bleach_file")" == *_A-BGREF_* ]] && continue
+        # (BGREF ST-B files no longer created — no guard needed)
         mv "$bleach_file" "$backup_dir/"
         bleach_moved=$((bleach_moved + 1))
     done
@@ -1082,6 +1079,14 @@ process_roi() {
     local mcmicro_input_dir
     mcmicro_input_dir=$(get_highest_exposure_dir "$staged_dir")
     log_msg "  Resolved MCMICRO input: $mcmicro_input_dir"
+
+    # Log expected ASHLAR round count when background subtraction is enabled
+    if [ "$USE_BACKGROUND_ALIGN" = true ] && [ -d "$mcmicro_input_dir/raw" ]; then
+        local n_raw_files
+        n_raw_files=$(find "$mcmicro_input_dir/raw" -name '*.ome.tiff' -o -name '*.ome.tif' | wc -l)
+        log_info "  ASHLAR will process $n_raw_files input files from raw/"
+        log_info "  (background: true causes MCMICRO to register both src-S and src-B files)"
+    fi
 
     # Run MCMICRO
     if ! run_mcmicro "$mcmicro_input_dir" "$roi_name"; then
