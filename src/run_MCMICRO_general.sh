@@ -505,6 +505,7 @@ inject_background_ref() {
         [ -f "$bleach_file" ] || continue
         # Don't move injected BGREF ST-B files — they need to stay for macsima2mc pairing
         [[ "$(basename "$bleach_file")" == *_A-BGREF_* ]] && continue
+        [[ "$(basename "$bleach_file")" == *_D-DAPI_* ]] && continue    # Keep DAPI bleach for pairing/backsub
         mv "$bleach_file" "$backup_dir/"
         bleach_moved=$((bleach_moved + 1))
     done
