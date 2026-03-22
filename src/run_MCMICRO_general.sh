@@ -342,17 +342,11 @@ duplicate_cycle1_as_cycle999() {
 
 inject_background_ref() {
     local roi_path="$1"
-    local scan_dir="${roi_path}/3_Scan2"
     local backup_dir="${roi_path}/.bgref_backup"
 
     # Find the Cycle1 directory
     local cycle1_dir
     cycle1_dir=$(find "$roi_path" -maxdepth 1 -type d -name '*_Cycle1' | head -1)
-
-    if [ ! -d "$scan_dir" ]; then
-        log_error "3_Scan2 directory not found in $roi_path — cannot inject background ref"
-        return 1
-    fi
 
     if [ -z "$cycle1_dir" ]; then
         log_error "No *_Cycle1 directory found in $roi_path — cannot inject background ref"
@@ -367,69 +361,13 @@ inject_background_ref() {
 
     mkdir -p "$backup_dir"
 
-    #--- Cycle1: Inject highest-exposure PE from 3_Scan2 as BGREF ---
+    #--- All cycles: Inject highest-exposure ST-B as BGREF ---
 
-    # Find all PE files in 3_Scan2
-    local pe_files=()
-    while IFS= read -r f; do
-        pe_files+=("$f")
-    done < <(find "$scan_dir" -maxdepth 1 -name '*_D-PE_*.tif' -type f 2>/dev/null)
-
-    if [ ${#pe_files[@]} -eq 0 ]; then
-        log_error "No PE files found in $scan_dir — cannot inject background ref"
-        rmdir "$backup_dir" 2>/dev/null || true
-        return 1
-    fi
-
-    # Determine highest exposure among PE files
-    local highest_exp="0"
-    for f in "${pe_files[@]}"; do
-        local exp_val
-        exp_val=$(basename "$f" | grep -oP 'EXP-\K[0-9]+(\.[0-9]+)?')
-        if [ -n "$exp_val" ]; then
-            if awk "BEGIN {exit !($exp_val > $highest_exp)}"; then
-                highest_exp="$exp_val"
-            fi
-        fi
-    done
-
-    # Copy highest-exposure PE tiles into Cycle1 as BGREF
-    local injected_cycle1=0
-    for f in "${pe_files[@]}"; do
-        local bname
-        bname=$(basename "$f")
-        # Only use the highest exposure tiles
-        local exp_val
-        exp_val=$(echo "$bname" | grep -oP 'EXP-\K[0-9]+(\.[0-9]+)?')
-        if [ "$exp_val" != "$highest_exp" ]; then
-            continue
-        fi
-        # Extract ROI, field, R, W identifiers from the scan filename
-        local r_id w_id roi_id f_id
-        r_id=$(echo "$bname" | grep -oP 'R-\K[0-9]+')
-        w_id=$(echo "$bname" | grep -oP 'W-\K[A-Z][0-9]+')
-        roi_id=$(echo "$bname" | grep -oP 'ROI-\K[0-9]+')
-        f_id=$(echo "$bname" | grep -oP 'F-\K[0-9]+')
-        # Build the BGREF filename for Cycle1
-        local new_name="CYC-001_SCN-002_ST-S_R-${r_id}_W-${w_id}_ROI-${roi_id}_F-${f_id}_A-BGREF_C-Reference_D-BGREF_EXP-${highest_exp}.tif"
-        cp "$f" "$cycle1_dir/$new_name"
-        # Also create ST-B counterpart (SCN-001) so macsima2mc can pair stain+bleach
-        local new_name_b="CYC-001_SCN-001_ST-B_R-${r_id}_W-${w_id}_ROI-${roi_id}_F-${f_id}_A-BGREF_C-Reference_D-BGREF_EXP-${highest_exp}.tif"
-        cp "$f" "$cycle1_dir/$new_name_b"
-        injected_cycle1=$((injected_cycle1 + 1))
-    done
-
-    #--- Cycle999 + other cycles: Inject highest-exposure ST-B as BGREF ---
-
-    local total_injected_other=0
+    local total_injected=0
     for cycle_dir in "$roi_path"/*_Cycle*/; do
         [ -d "$cycle_dir" ] || continue
         local cycle_basename
         cycle_basename=$(basename "$cycle_dir")
-        # Skip Cycle1 (already handled above)
-        if [[ "$cycle_basename" == *_Cycle1 ]]; then
-            continue
-        fi
         # Extract cycle number from directory name (e.g. "999" from "999_Cycle999")
         local cycle_num
         cycle_num=$(echo "$cycle_basename" | grep -oP 'Cycle\K[0-9]+')
@@ -494,7 +432,7 @@ inject_background_ref() {
             # Also create ST-B counterpart (SCN-001) so macsima2mc can pair stain+bleach
             local new_name_b="CYC-${cyc_padded}_SCN-001_ST-B_R-${r_id}_W-${w_id}_ROI-${roi_id}_F-${f_id}_A-BGREF_C-Reference_D-BGREF_EXP-${he_stb}.tif"
             cp "$f" "$cycle_dir/$new_name_b"
-            total_injected_other=$((total_injected_other + 1))
+            total_injected=$((total_injected + 1))
         done
     done
 
@@ -755,7 +693,44 @@ if marked > 0:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerows(rows)
+
+kept = [f\"{r['marker_name']}(c{r.get('cycle_number','')})\" for r in rows
+        if r.get('remove', '').upper() != 'TRUE']
+removed = [f\"{r['marker_name']}(c{r.get('cycle_number','')})\" for r in rows
+           if r.get('remove', '').upper() == 'TRUE']
+print(f'Channels kept ({len(kept)}): {chr(44).join(chr(32) + c for c in kept).lstrip()}')
+print(f'Channels removed ({len(removed)}): {chr(44).join(chr(32) + c for c in removed).lstrip()}')
 " "$markers_csv" 2>&1 | while read -r line; do log_info "$line"; done
+    done < <(find "$staged_dir" -name "markers.csv" -type f)
+}
+
+verify_dapi_present() {
+    local staged_dir="$1"
+
+    local markers_csv
+    while IFS= read -r markers_csv; do
+        [ -f "$markers_csv" ] || continue
+        python3 -c "
+import csv, sys
+
+path = sys.argv[1]
+with open(path) as f:
+    reader = csv.DictReader(f)
+    rows = list(reader)
+
+dapi_rows = [r for r in rows if r.get('marker_name') == 'DAPI'
+             and r.get('remove', '').upper() != 'TRUE']
+if not dapi_rows:
+    print('WARNING: No DAPI channel found in final output!')
+    print('All DAPI entries:')
+    for r in rows:
+        if 'DAPI' in r.get('marker_name', '').upper():
+            print(f\"  cycle={r.get('cycle_number')} marker={r.get('marker_name')} remove={r.get('remove', '')}\")
+    if not any('DAPI' in r.get('marker_name', '').upper() for r in rows):
+        print('  (no DAPI entries found in markers.csv at all)')
+else:
+    print(f\"DAPI present: cycle {dapi_rows[0].get('cycle_number')}, remove={dapi_rows[0].get('remove', '(empty)')}\")
+" "$markers_csv" 2>&1 | while read -r line; do log_warning "$line"; done
     done < <(find "$staged_dir" -name "markers.csv" -type f)
 }
 
@@ -1034,6 +1009,7 @@ process_roi() {
             else
                 mark_background_markers_removed "$staged_dir"
             fi
+            verify_dapi_present "$staged_dir"
         fi
         if [ "$staging_failed" = true ]; then
             if [ "$DRY_RUN" = false ]; then
