@@ -679,10 +679,6 @@ for r in rows:
     if marker == 'BGREF':
         r['remove'] = 'TRUE'
         marked += 1
-    # Cycle 1 non-DAPI markers are misaligned (acquired at original positions, not Scan positions)
-    elif cycle == 1 and marker != 'DAPI':
-        r['remove'] = 'TRUE'
-        marked += 1
     # Cycle 999 DAPI is the original bad-quality DAPI — only needed for alignment
     elif cycle == 999 and marker == 'DAPI':
         r['remove'] = 'TRUE'
