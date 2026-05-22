@@ -361,45 +361,14 @@ inject_background_ref() {
 
     mkdir -p "$backup_dir"
 
-    #--- Determine ONE filter for the entire ROI (must be consistent across all cycles) ---
-    # ASHLAR aligns all cycles to Cycle1 using BGREF. If different cycles use
-    # different filters (PE vs FITC), the autofluorescence patterns won't match
-    # and phase correlation fails. Pick the highest-priority filter available in ALL cycles.
-
-    local global_filter=""
-    for filter_name in PE FITC APC; do
-        local all_have=true
-        for cycle_dir in "$roi_path"/*_Cycle*/; do
-            [ -d "$cycle_dir" ] || continue
-            local search_dir="$cycle_dir"
-            [[ "$(basename "$cycle_dir")" == *_Cycle999 ]] && search_dir="$cycle1_dir"
-            local count
-            count=$(find "$search_dir" -maxdepth 1 -name "*_ST-B_*_D-${filter_name}_*.tif" -type f 2>/dev/null | wc -l)
-            if [ "$count" -eq 0 ]; then
-                all_have=false
-                break
-            fi
-        done
-        if [ "$all_have" = true ]; then
-            global_filter="$filter_name"
-            break
-        fi
-    done
-
-    if [ -z "$global_filter" ]; then
-        log_error "No single filter (PE/FITC/APC) is available in ALL cycles — cannot inject consistent BGREF"
-        rmdir "$backup_dir" 2>/dev/null || true
-        return 1
-    fi
-    log_info "Selected filter for BGREF across all cycles: $global_filter"
-
-    #--- All cycles: Inject highest-exposure ST-B as BGREF using the global filter ---
+    #--- All cycles: Inject highest-exposure ST-B as BGREF ---
 
     local total_injected=0
     for cycle_dir in "$roi_path"/*_Cycle*/; do
         [ -d "$cycle_dir" ] || continue
         local cycle_basename
         cycle_basename=$(basename "$cycle_dir")
+        # Extract cycle number from directory name (e.g. "999" from "999_Cycle999")
         local cycle_num
         cycle_num=$(echo "$cycle_basename" | grep -oP 'Cycle\K[0-9]+')
         local cyc_padded
@@ -412,14 +381,23 @@ inject_background_ref() {
             stb_search_dir="$cycle1_dir"
         fi
 
-        # Find ST-B files for the globally selected filter
+        # Find ST-B files with filter priority: PE > FITC > APC
+        local chosen_filter=""
         local stb_files=()
-        while IFS= read -r f; do
-            stb_files+=("$f")
-        done < <(find "$stb_search_dir" -maxdepth 1 -name "*_ST-B_*_D-${global_filter}_*.tif" -type f 2>/dev/null)
+        for filter_name in PE FITC APC; do
+            local candidates=()
+            while IFS= read -r f; do
+                candidates+=("$f")
+            done < <(find "$stb_search_dir" -maxdepth 1 -name "*_ST-B_*_D-${filter_name}_*.tif" -type f 2>/dev/null)
+            if [ ${#candidates[@]} -gt 0 ]; then
+                chosen_filter="$filter_name"
+                stb_files=("${candidates[@]}")
+                break
+            fi
+        done
 
-        if [ ${#stb_files[@]} -eq 0 ]; then
-            log_warning "No ${global_filter} ST-B files in $cycle_dir — skipping BGREF for this cycle"
+        if [ -z "$chosen_filter" ]; then
+            log_warning "No suitable ST-B files found in $cycle_dir — skipping BGREF injection for this cycle"
             continue
         fi
 
