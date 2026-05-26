@@ -400,6 +400,7 @@ inject_background_ref() {
             log_warning "No suitable ST-B files found in $cycle_dir — skipping BGREF injection for this cycle"
             continue
         fi
+        log_info "  Cycle $cycle_num: using $chosen_filter for BGREF (${#stb_files[@]} tiles)"
 
         # Determine highest exposure among chosen filter's ST-B files
         local he_stb="0"
@@ -448,6 +449,36 @@ inject_background_ref() {
         bleach_moved=$((bleach_moved + 1))
     done
     return 0
+}
+
+preprocess_bgref_tiles() {
+    # Apply CLAHE to all injected BGREF tiles for cross-filter consistency.
+    # Different cycles may use different filters (PE/FITC/APC) whose autofluorescence
+    # shows the same tissue structures at different brightness. CLAHE locally normalizes
+    # contrast so tiles from different filters look comparable → ASHLAR phase correlation
+    # works across filters.
+    local roi_path="$1"
+    local processed=0
+    for cycle_dir in "$roi_path"/*_Cycle*/; do
+        [ -d "$cycle_dir" ] || continue
+        for bgref_file in "$cycle_dir"/*_A-BGREF_*.tif; do
+            [ -f "$bgref_file" ] || continue
+            python3 -c "
+import tifffile, numpy as np
+from skimage.exposure import equalize_adapthist
+
+img = tifffile.imread('$bgref_file')
+img_f = img.astype(np.float64)
+imax = np.iinfo(img.dtype).max if np.issubdtype(img.dtype, np.integer) else 1.0
+img_f /= imax
+enhanced = equalize_adapthist(img_f, clip_limit=0.03)
+enhanced = (enhanced * np.iinfo(np.uint16).max).astype(np.uint16)
+tifffile.imwrite('$bgref_file', enhanced)
+"
+            processed=$((processed + 1))
+        done
+    done
+    log_info "CLAHE-preprocessed $processed BGREF tiles for cross-filter consistency"
 }
 
 restore_background_ref() {
@@ -983,6 +1014,7 @@ process_roi() {
             else
                 duplicate_cycle1_as_cycle999 "$roi_path"
                 inject_background_ref "$roi_path"
+                preprocess_bgref_tiles "$roi_path"
                 fix_dapi_for_bgref "$roi_path"
             fi
         fi
