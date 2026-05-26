@@ -472,6 +472,8 @@ path = '$bgref_file'
 with tifffile.TiffFile(path) as tif:
     img = tif.pages[0].asarray()
     description = tif.pages[0].description
+    # Strip non-ASCII (OME XML may contain µm², etc.) — tifffile requires 7-bit ASCII
+    description = description.encode('ascii', 'ignore').decode('ascii')
 
 img_f = img.astype(np.float64)
 imax = np.iinfo(img.dtype).max if np.issubdtype(img.dtype, np.integer) else 1.0
