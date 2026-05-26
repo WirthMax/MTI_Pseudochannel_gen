@@ -467,13 +467,18 @@ preprocess_bgref_tiles() {
 import tifffile, numpy as np
 from skimage.exposure import equalize_adapthist
 
-img = tifffile.imread('$bgref_file')
+path = '$bgref_file'
+# Read image and preserve OME metadata (macsima2mc needs it)
+with tifffile.TiffFile(path) as tif:
+    img = tif.pages[0].asarray()
+    description = tif.pages[0].description
+
 img_f = img.astype(np.float64)
 imax = np.iinfo(img.dtype).max if np.issubdtype(img.dtype, np.integer) else 1.0
 img_f /= imax
 enhanced = equalize_adapthist(img_f, clip_limit=0.03)
 enhanced = (enhanced * np.iinfo(np.uint16).max).astype(np.uint16)
-tifffile.imwrite('$bgref_file', enhanced)
+tifffile.imwrite(path, enhanced, description=description)
 "
             processed=$((processed + 1))
         done
