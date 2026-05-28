@@ -466,20 +466,38 @@ preprocess_bgref_tiles() {
             python3 -c "
 import tifffile, numpy as np
 from skimage.exposure import equalize_adapthist
+from skimage.filters import threshold_otsu
 
 path = '$bgref_file'
 # Read image and preserve OME metadata (macsima2mc needs it)
 with tifffile.TiffFile(path) as tif:
     img = tif.pages[0].asarray()
     description = tif.pages[0].description
-    # Strip non-ASCII (OME XML may contain µm², etc.) — tifffile requires 7-bit ASCII
     description = description.encode('ascii', 'ignore').decode('ascii')
 
 img_f = img.astype(np.float64)
 imax = np.iinfo(img.dtype).max if np.issubdtype(img.dtype, np.integer) else 1.0
 img_f /= imax
-enhanced = equalize_adapthist(img_f, clip_limit=0.03)
-enhanced = (enhanced * np.iinfo(np.uint16).max).astype(np.uint16)
+
+# Otsu threshold to find tissue region — skip CLAHE on background-only tiles
+nonzero = img_f[img_f > 0]
+if len(nonzero) > 100:
+    thresh = threshold_otsu(nonzero)
+    tissue_mask = img_f > thresh * 0.5  # generous tissue boundary
+    tissue_frac = tissue_mask.sum() / tissue_mask.size
+else:
+    tissue_frac = 0.0
+    tissue_mask = np.zeros_like(img_f, dtype=bool)
+
+if tissue_frac < 0.10:
+    # Mostly background — skip CLAHE to avoid amplifying noise
+    enhanced = img
+else:
+    # CLAHE on full image, then restore background to original (no noise amplification)
+    clahe = equalize_adapthist(img_f, clip_limit=0.03)
+    enhanced = (clahe * np.iinfo(np.uint16).max).astype(np.uint16)
+    enhanced[~tissue_mask] = img[~tissue_mask]
+
 tifffile.imwrite(path, enhanced, description=description)
 "
             processed=$((processed + 1))
