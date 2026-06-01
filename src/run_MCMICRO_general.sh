@@ -84,7 +84,8 @@ log_msg() {
 #==============================================================================
 
 validate_config() {
-    local errors=0
+    local errors
+    errors=0
 
     # Cleanup-only mode needs only staging and output dirs
     if [ "$CLEANUP_BACKGROUND" = true ]; then
@@ -167,13 +168,15 @@ validate_config() {
 #==============================================================================
 
 should_skip_experiment() {
-    local exp_name="$1"
+    local exp_name
+    exp_name="$1"
 
     if [ -z "$SKIP_EXPERIMENTS" ]; then
         return 1
     fi
 
-    local SKIP_LIST=()
+    local SKIP_LIST
+    SKIP_LIST=()
     local _item
     while IFS= read -r _item; do
         _item=$(echo "$_item" | xargs)  # trim whitespace
@@ -190,7 +193,8 @@ should_skip_experiment() {
 }
 
 matches_experiment_filter() {
-    local exp_name="$1"
+    local exp_name
+    exp_name="$1"
     if [ -z "$EXPERIMENT_FILTER" ]; then
         return 0  # No filter = match all
     fi
@@ -201,7 +205,8 @@ matches_experiment_filter() {
 }
 
 is_already_staged() {
-    local staged_dir="$1"
+    local staged_dir
+    staged_dir="$1"
     if [ -d "$staged_dir" ] && [ -n "$(ls -A "$staged_dir" 2>/dev/null)" ]; then
         return 0
     fi
@@ -209,9 +214,12 @@ is_already_staged() {
 }
 
 swap_scan_dapi_into_cycle1() {
-    local roi_path="$1"
-    local scan_dir="${roi_path}/3_Scan2"
-    local backup_dir="${roi_path}/.dapi_backup"
+    local roi_path
+    roi_path="$1"
+    local scan_dir
+    scan_dir="${roi_path}/3_Scan2"
+    local backup_dir
+    backup_dir="${roi_path}/.dapi_backup"
 
     # Find the Cycle1 directory (e.g. 6_Cycle1)
     local cycle1_dir
@@ -236,13 +244,15 @@ swap_scan_dapi_into_cycle1() {
     mkdir -p "$backup_dir"
 
     # Collect unique ROI identifiers from scan DAPI files
-    local rois=()
+    local rois
+    rois=()
     local roi_id
     for f in "$scan_dir"/*_D-DAPI_*.tif; do
         [ -f "$f" ] || continue
         roi_id=$(basename "$f" | grep -oE 'ROI-[0-9]+')
         if [ -n "$roi_id" ]; then
-            local found=false
+            local found
+            found=false
             for r in "${rois[@]+"${rois[@]}"}"; do
                 if [ "$r" = "$roi_id" ]; then
                     found=true
@@ -261,16 +271,19 @@ swap_scan_dapi_into_cycle1() {
         return 1
     fi
 
-    local total_swapped=0
+    local total_swapped
+    total_swapped=0
     for roi_id in "${rois[@]}"; do
         # Collect scan DAPI files for this ROI, sorted by F-number
-        local scan_dapis=()
+        local scan_dapis
+        scan_dapis=()
         while IFS= read -r f; do
             scan_dapis+=("$f")
         done < <(find "$scan_dir" -name "*_${roi_id}_*_D-DAPI_*.tif" -type f | sort -V)
 
         # Collect Cycle1 Stain DAPI files for this ROI, sorted by F-number
-        local cycle1_dapis=()
+        local cycle1_dapis
+        cycle1_dapis=()
         while IFS= read -r f; do
             cycle1_dapis+=("$f")
         done < <(find "$cycle1_dir" -name "*_ST-S_*_${roi_id}_*_D-DAPI_*.tif" -type f | sort -V)
@@ -297,7 +310,8 @@ swap_scan_dapi_into_cycle1() {
 
     # Also move bleach (ST-B) files out of cycle1 so macsima2mc only produces the stain OME-TIFF.
     # This prevents cross-round registration issues between bleach DAPI and scan DAPI.
-    local bleach_moved=0
+    local bleach_moved
+    bleach_moved=0
     for bleach_file in "$cycle1_dir"/*_ST-B_*.tif; do
         [ -f "$bleach_file" ] || continue
         mv "$bleach_file" "$backup_dir/"
@@ -308,7 +322,8 @@ swap_scan_dapi_into_cycle1() {
 }
 
 duplicate_cycle1_as_cycle999() {
-    local roi_path="$1"
+    local roi_path
+    roi_path="$1"
 
     # Find the Cycle1 directory (e.g. 6_Cycle1)
     local cycle1_dir
@@ -320,17 +335,20 @@ duplicate_cycle1_as_cycle999() {
     fi
 
     # Determine the directory prefix number (e.g. "6" from "6_Cycle1") and create 999_Cycle999
-    local cycle999_dir="${roi_path}/999_Cycle999"
+    local cycle999_dir
+    cycle999_dir="${roi_path}/999_Cycle999"
     mkdir -p "$cycle999_dir"
 
     # Copy only stain files (ST-S: DAPI + markers) from Cycle1
-    local copied=0
+    local copied
+    copied=0
     for stain_file in "$cycle1_dir"/*_ST-S_*.tif; do
         [ -f "$stain_file" ] || continue
         local basename_f
         basename_f=$(basename "$stain_file")
         # Rename CYC-001 → CYC-999 in filename
-        local new_name="${basename_f//CYC-001/CYC-999}"
+        local new_name
+        new_name="${basename_f//CYC-001/CYC-999}"
         cp "$stain_file" "$cycle999_dir/$new_name"
         copied=$((copied + 1))
     done
@@ -346,8 +364,10 @@ duplicate_cycle1_as_cycle999() {
 }
 
 inject_background_ref() {
-    local roi_path="$1"
-    local backup_dir="${roi_path}/.bgref_backup"
+    local roi_path
+    roi_path="$1"
+    local backup_dir
+    backup_dir="${roi_path}/.bgref_backup"
 
     # Find the Cycle1 directory
     local cycle1_dir
@@ -368,7 +388,8 @@ inject_background_ref() {
 
     #--- All cycles: Inject highest-exposure ST-B as BGREF ---
 
-    local total_injected=0
+    local total_injected
+    total_injected=0
     for cycle_dir in "$roi_path"/*_Cycle*/; do
         [ -d "$cycle_dir" ] || continue
         local cycle_basename
@@ -381,16 +402,20 @@ inject_background_ref() {
 
         # Determine where to search for ST-B files
         # Cycle999 is a duplicate of Cycle1 stain files and has no ST-B; use Cycle1's
-        local stb_search_dir="$cycle_dir"
+        local stb_search_dir
+        stb_search_dir="$cycle_dir"
         if [[ "$cycle_basename" == *_Cycle999 ]]; then
             stb_search_dir="$cycle1_dir"
         fi
 
         # Find ST-B files with filter priority: PE > FITC > APC
-        local chosen_filter=""
-        local stb_files=()
+        local chosen_filter
+        chosen_filter=""
+        local stb_files
+        stb_files=()
         for filter_name in PE FITC APC; do
-            local candidates=()
+            local candidates
+            candidates=()
             while IFS= read -r f; do
                 candidates+=("$f")
             done < <(find "$stb_search_dir" -maxdepth 1 -name "*_ST-B_*_D-${filter_name}_*.tif" -type f 2>/dev/null)
@@ -408,7 +433,8 @@ inject_background_ref() {
         log_detail "  Cycle $cycle_num: using $chosen_filter for BGREF (${#stb_files[@]} tiles)"
 
         # Determine highest exposure among chosen filter's ST-B files
-        local he_stb="0"
+        local he_stb
+        he_stb="0"
         for f in "${stb_files[@]}"; do
             local exp_val
             exp_val=$(basename "$f" | grep -oP 'EXP-\K[0-9]+(\.[0-9]+)?')
@@ -433,10 +459,12 @@ inject_background_ref() {
             w_id=$(echo "$bname" | grep -oP 'W-\K[A-Z][0-9]+')
             roi_id=$(echo "$bname" | grep -oP 'ROI-\K[0-9]+')
             f_id=$(echo "$bname" | grep -oP 'F-\K[0-9]+')
-            local new_name="CYC-${cyc_padded}_SCN-002_ST-S_R-${r_id}_W-${w_id}_ROI-${roi_id}_F-${f_id}_A-BGREF_C-Reference_D-BGREF_EXP-${he_stb}.tif"
+            local new_name
+            new_name="CYC-${cyc_padded}_SCN-002_ST-S_R-${r_id}_W-${w_id}_ROI-${roi_id}_F-${f_id}_A-BGREF_C-Reference_D-BGREF_EXP-${he_stb}.tif"
             cp "$f" "$cycle_dir/$new_name"
             # Also create ST-B counterpart (SCN-001) so macsima2mc can pair stain+bleach
-            local new_name_b="CYC-${cyc_padded}_SCN-001_ST-B_R-${r_id}_W-${w_id}_ROI-${roi_id}_F-${f_id}_A-BGREF_C-Reference_D-BGREF_EXP-${he_stb}.tif"
+            local new_name_b
+            new_name_b="CYC-${cyc_padded}_SCN-001_ST-B_R-${r_id}_W-${w_id}_ROI-${roi_id}_F-${f_id}_A-BGREF_C-Reference_D-BGREF_EXP-${he_stb}.tif"
             cp "$f" "$cycle_dir/$new_name_b"
             total_injected=$((total_injected + 1))
         done
@@ -444,7 +472,8 @@ inject_background_ref() {
 
     # Move Cycle1 ST-B (bleach) files to backup to prevent staging issues
     # Done AFTER the other-cycles loop so Cycle999 can still find Cycle1's ST-B files
-    local bleach_moved=0
+    local bleach_moved
+    bleach_moved=0
     for bleach_file in "$cycle1_dir"/*_ST-B_*.tif; do
         [ -f "$bleach_file" ] || continue
         # Don't move injected BGREF ST-B files — they need to stay for macsima2mc pairing
@@ -462,8 +491,10 @@ preprocess_bgref_tiles() {
     # shows the same tissue structures at different brightness. CLAHE locally normalizes
     # contrast so tiles from different filters look comparable → ASHLAR phase correlation
     # works across filters.
-    local roi_path="$1"
-    local processed=0
+    local roi_path
+    roi_path="$1"
+    local processed
+    processed=0
     for cycle_dir in "$roi_path"/*_Cycle*/; do
         [ -d "$cycle_dir" ] || continue
         for bgref_file in "$cycle_dir"/*_A-BGREF_*.tif; do
@@ -516,11 +547,14 @@ except Exception as e:
 }
 
 restore_background_ref() {
-    local roi_path="$1"
-    local backup_dir="${roi_path}/.bgref_backup"
+    local roi_path
+    roi_path="$1"
+    local backup_dir
+    backup_dir="${roi_path}/.bgref_backup"
 
     # Remove all injected BGREF files from all cycle directories
-    local removed=0
+    local removed
+    removed=0
     for cycle_dir in "$roi_path"/*_Cycle*/; do
         [ -d "$cycle_dir" ] || continue
         for bgref_file in "$cycle_dir"/*_A-BGREF_C-Reference_*.tif; do
@@ -534,7 +568,8 @@ restore_background_ref() {
         local cycle1_dir
         cycle1_dir=$(find "$roi_path" -maxdepth 1 -type d -name '*_Cycle1' | head -1)
         if [ -n "$cycle1_dir" ]; then
-            local restored=0
+            local restored
+            restored=0
             for backup_file in "$backup_dir"/*.tif; do
                 [ -f "$backup_file" ] || continue
                 mv "$backup_file" "$cycle1_dir/"
@@ -547,7 +582,8 @@ restore_background_ref() {
     fi
 
     # Remove Cycle999 directory
-    local cycle999_dir="${roi_path}/999_Cycle999"
+    local cycle999_dir
+    cycle999_dir="${roi_path}/999_Cycle999"
     if [ -d "$cycle999_dir" ]; then
         rm -rf "$cycle999_dir"
     fi
@@ -556,8 +592,10 @@ restore_background_ref() {
 }
 
 fix_dapi_for_bgref() {
-    local roi_path="$1"
-    local fixed=0
+    local roi_path
+    roi_path="$1"
+    local fixed
+    fixed=0
     for cycle_dir in "$roi_path"/*_Cycle*/; do
         [ -d "$cycle_dir" ] || continue
         for f in "$cycle_dir"/*_D-DAPI_*.tif; do
@@ -565,7 +603,8 @@ fix_dapi_for_bgref() {
             local bname
             bname=$(basename "$f")
             [[ "$bname" == *_A-*_C-* ]] && continue
-            local new_name="${bname/_D-DAPI_/_A-DAPI_C-_D-DAPI_}"
+            local new_name
+            new_name="${bname/_D-DAPI_/_A-DAPI_C-_D-DAPI_}"
             mv "$f" "$(dirname "$f")/$new_name"
             fixed=$((fixed + 1))
         done
@@ -573,15 +612,18 @@ fix_dapi_for_bgref() {
 }
 
 restore_dapi_for_bgref() {
-    local roi_path="$1"
-    local restored=0
+    local roi_path
+    roi_path="$1"
+    local restored
+    restored=0
     for cycle_dir in "$roi_path"/*_Cycle*/; do
         [ -d "$cycle_dir" ] || continue
         for f in "$cycle_dir"/*_A-DAPI_C-_D-DAPI_*.tif; do
             [ -f "$f" ] || continue
             local bname
             bname=$(basename "$f")
-            local new_name="${bname/_A-DAPI_C-_D-DAPI_/_D-DAPI_}"
+            local new_name
+            new_name="${bname/_A-DAPI_C-_D-DAPI_/_D-DAPI_}"
             mv "$f" "$(dirname "$f")/$new_name"
             restored=$((restored + 1))
         done
@@ -589,8 +631,10 @@ restore_dapi_for_bgref() {
 }
 
 restore_cycle1_dapi() {
-    local roi_path="$1"
-    local backup_dir="${roi_path}/.dapi_backup"
+    local roi_path
+    roi_path="$1"
+    local backup_dir
+    backup_dir="${roi_path}/.dapi_backup"
 
     if [ ! -d "$backup_dir" ]; then
         return 0
@@ -604,7 +648,8 @@ restore_cycle1_dapi() {
         return 1
     fi
 
-    local restored=0
+    local restored
+    restored=0
     for backup_file in "$backup_dir"/*.tif; do
         [ -f "$backup_file" ] || continue
         mv "$backup_file" "$cycle1_dir/"
@@ -614,7 +659,8 @@ restore_cycle1_dapi() {
     rm -rf "$backup_dir"
 
     # Remove the fake Cycle999 directory if it exists (created by duplicate_cycle1_as_cycle999)
-    local cycle999_dir="${roi_path}/999_Cycle999"
+    local cycle999_dir
+    cycle999_dir="${roi_path}/999_Cycle999"
     if [ -d "$cycle999_dir" ]; then
         rm -rf "$cycle999_dir"
     fi
@@ -623,7 +669,8 @@ restore_cycle1_dapi() {
 }
 
 clean_markers_background() {
-    local staged_dir="$1"
+    local staged_dir
+    staged_dir="$1"
 
     local markers_csv
     while IFS= read -r markers_csv; do
@@ -655,7 +702,8 @@ if cleaned > 0:
 }
 
 clear_bgref_background_refs() {
-    local staged_dir="$1"
+    local staged_dir
+    staged_dir="$1"
 
     local markers_csv
     while IFS= read -r markers_csv; do
@@ -685,7 +733,8 @@ if cleared > 0:
 }
 
 mark_cycle1_markers_removed() {
-    local staged_dir="$1"
+    local staged_dir
+    staged_dir="$1"
 
     local markers_csv
     while IFS= read -r markers_csv; do
@@ -722,7 +771,8 @@ if marked > 0:
 }
 
 mark_background_markers_removed() {
-    local staged_dir="$1"
+    local staged_dir
+    staged_dir="$1"
 
     local markers_csv
     while IFS= read -r markers_csv; do
@@ -766,7 +816,8 @@ print(f'Channels removed ({len(removed)}): {chr(44).join(chr(32) + c for c in re
 }
 
 verify_dapi_present() {
-    local staged_dir="$1"
+    local staged_dir
+    staged_dir="$1"
 
     local markers_csv
     while IFS= read -r markers_csv; do
@@ -796,7 +847,8 @@ else:
 }
 
 cleanup_background_markers() {
-    local count=0
+    local count
+    count=0
     local markers_csv
     while IFS= read -r markers_csv; do
         [ -f "$markers_csv" ] || continue
@@ -828,7 +880,8 @@ if marked > 0:
 
 # Return the highest-exposure directory under base_dir, or base_dir itself.
 get_highest_exposure_dir() {
-    local base_dir="$1"
+    local base_dir
+    base_dir="$1"
     local highest_raw
 
     # Find last (highest) raw dir alphabetically — works in both bash and zsh
@@ -840,7 +893,8 @@ get_highest_exposure_dir() {
     fi
 
     highest_raw="${highest_raw%/}"
-    local parent_dir="${highest_raw%/*}"
+    local parent_dir
+    parent_dir="${highest_raw%/*}"
 
     echo "$parent_dir"
 }
@@ -850,9 +904,12 @@ get_highest_exposure_dir() {
 #==============================================================================
 
 stage_roi() {
-    local roi_path="$1"
-    local output_dir="$2"
-    local roi_name="$3"
+    local roi_path
+    roi_path="$1"
+    local output_dir
+    output_dir="$2"
+    local roi_name
+    roi_name="$3"
 
     if [ "$DRY_RUN" = true ]; then
         log_msg "  Would stage ROI: $roi_name"
@@ -879,7 +936,8 @@ stage_roi() {
         return 1
     fi
 
-    local cycle_count=0
+    local cycle_count
+    cycle_count=0
     for cycle in "${roi_path}"/*_Cycle*/; do
         [ -d "$cycle" ] || continue
 
@@ -888,7 +946,8 @@ stage_roi() {
 
         cycle_count=$((cycle_count + 1))
 
-        local he_flag=""
+        local he_flag
+        he_flag=""
         if [ "$USE_HIGHEST_EXPOSURE" = true ]; then
             he_flag="-he"
         fi
@@ -927,11 +986,14 @@ stage_roi() {
 #==============================================================================
 
 run_mcmicro() {
-    local staged_dir="$1"
-    local roi_name="$2"
+    local staged_dir
+    staged_dir="$1"
+    local roi_name
+    roi_name="$2"
     local timestamp
     timestamp=$(date +%Y%m%d_%H%M%S)
-    local output_report="${MCMICRO_OUTPUT_BASE}/${roi_name}_report_${timestamp}.html"
+    local output_report
+    output_report="${MCMICRO_OUTPUT_BASE}/${roi_name}_report_${timestamp}.html"
 
     if [ "$DRY_RUN" = true ]; then
         log_msg "  Would run MCMICRO for: $roi_name"
@@ -967,8 +1029,10 @@ run_mcmicro() {
 #==============================================================================
 
 cleanup_staged() {
-    local staged_dir="$1"
-    local roi_name="$2"
+    local staged_dir
+    staged_dir="$1"
+    local roi_name
+    roi_name="$2"
 
     log_info "Cleaning up staged data for: $roi_name"
 
@@ -987,7 +1051,8 @@ cleanup_staged() {
 }
 
 cleanup_mcmicro_work() {
-    local roi_name="$1"
+    local roi_name
+    roi_name="$1"
 
     log_info "Cleaning up MCMICRO work directory for: $roi_name"
 
@@ -1014,9 +1079,12 @@ cleanup_mcmicro_work() {
 #==============================================================================
 
 process_roi() {
-    local roi_path="$1"
-    local roi_name="$2"
-    local staged_dir="${STAGING_BASE_DIR}/${roi_name}_staged"
+    local roi_path
+    roi_path="$1"
+    local roi_name
+    roi_name="$2"
+    local staged_dir
+    staged_dir="${STAGING_BASE_DIR}/${roi_name}_staged"
 
     log_msg "Processing ROI: $roi_name"
 
@@ -1052,7 +1120,8 @@ process_roi() {
                 fix_dapi_for_bgref "$roi_path"
             fi
         fi
-        local staging_failed=false
+        local staging_failed
+        staging_failed=false
         if ! stage_roi "$roi_path" "$staged_dir" "$roi_name"; then
             staging_failed=true
         fi
@@ -1117,8 +1186,10 @@ process_roi() {
 #==============================================================================
 
 process_experiment() {
-    local exp_dir="$1"
-    local exp_name="$2"
+    local exp_dir
+    exp_dir="$1"
+    local exp_name
+    exp_name="$2"
 
     for data_dir in "$exp_dir"/*/; do
         [ -d "$data_dir" ] || continue
@@ -1165,7 +1236,8 @@ process_experiment() {
                     fi
 
                     TOTAL_ROIS=$((TOTAL_ROIS + 1))
-                    local roi_identifier="${exp_name}_${r_name}_${a_name}_${roi_name}"
+                    local roi_identifier
+                    roi_identifier="${exp_name}_${r_name}_${a_name}_${roi_name}"
 
                     if process_roi "$roi_folder" "$roi_identifier"; then
                         PROCESSED_ROIS=$((PROCESSED_ROIS + 1))
