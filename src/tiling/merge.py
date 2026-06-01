@@ -382,16 +382,21 @@ def match_cells_in_overlap(
     iou_threshold: float = 0.5,
     max_centroid_distance: float = 50.0,
     min_iou_for_centroid_match: float = 0.01,
+    containment_threshold: float = 0.7,
+    min_containment_intersection: int = 100,
 ) -> tuple[list[tuple[int, int]], list[int]]:
     """Match cells between existing merged mask and new tile in overlap region.
 
-    Uses a hybrid matching strategy:
-    1. Primary: IoU >= iou_threshold in overlap region
-    2. Fallback: Centroid distance < max_centroid_distance AND IoU > min_iou
-
-    The fallback handles edge cases where a cell has minimal pixels in the
-    overlap region (causing unreliable IoU) but centroids clearly indicate
-    it's the same cell.
+    Uses a three-tier matching strategy:
+    1. Primary (IoU): IoU >= iou_threshold in overlap region
+    2. Secondary (containment / IoM): intersection / min(area_a, area_b)
+       >= containment_threshold AND intersection >= min_containment_intersection.
+       Catches "crescent" artifacts where the same biological cell has
+       very different mask sizes across tiles (e.g. clipped at one tile's
+       edge, full extent in the other). When one mask is largely contained
+       in the other, IoU is depressed below threshold but IoM stays near 1.
+    3. Fallback (centroid): Centroid distance < max_centroid_distance AND
+       IoU > min_iou_for_centroid_match.
 
     Args:
         mask_existing: Already-merged mask (in original image coordinates)
@@ -404,6 +409,11 @@ def match_cells_in_overlap(
         iou_threshold: Minimum IoU for primary matching (default 0.5)
         max_centroid_distance: Maximum centroid distance for fallback matching (default 50px)
         min_iou_for_centroid_match: Minimum IoU required for centroid-based match (default 0.01)
+        containment_threshold: Minimum IoM (intersection / min-area) for
+            containment-based matching (default 0.7).
+        min_containment_intersection: Minimum absolute intersection pixels
+            required for the containment tier to fire (default 100). Prevents
+            spurious matches between small cells when overlap fragments are tiny.
 
     Returns:
         Tuple of:
@@ -454,73 +464,90 @@ def match_cells_in_overlap(
     if not existing_labels or not new_labels:
         return [], list(new_labels)
 
-    # --- Sparse IoU: only compare label pairs that share pixels ---
-    # For each existing label, find which new labels overlap with it.
-    # This avoids the O(E*N) dense matrix when most pairs have IoU=0.
+    # --- Vectorized contingency: O(n_overlap_pixels) instead of O(n_labels × n_pixels) ---
+    # 1) Per-label areas via a single bincount over each overlap region.
+    # 2) Pairwise intersections via a single np.unique over packed (existing, new)
+    #    pixel pairs. Builds the full sparse contingency in one pass.
+    ex_flat = existing_overlap.ravel()
+    nw_flat = new_overlap.ravel()
 
-    # Pre-compute areas for each label in the overlap region
-    existing_areas = {}
-    new_areas = {}
+    ex_areas_arr = np.bincount(ex_flat)
+    nw_areas_arr = np.bincount(nw_flat)
 
-    for label in existing_labels:
-        existing_areas[label] = int(np.sum(existing_overlap == label))
-    for label in new_labels:
-        new_areas[label] = int(np.sum(new_overlap == label))
+    existing_areas = {int(l): int(ex_areas_arr[l]) for l in existing_labels
+                      if l < ex_areas_arr.size}
+    new_areas = {int(l): int(nw_areas_arr[l]) for l in new_labels
+                 if l < nw_areas_arr.size}
 
-    # Build sparse candidate pairs: for each existing cell, find new cells
-    # that share at least one pixel in the overlap
-    candidates = {}  # existing_label -> {new_label: iou}
-    for existing_label in existing_labels:
-        ex_mask = existing_overlap == existing_label
-        # Which new labels overlap with this existing cell?
-        overlapping_new = set(np.unique(new_overlap[ex_mask]).tolist())
-        overlapping_new.discard(0)
-        overlapping_new &= new_labels  # Only labels actually in overlap
+    candidates = {}  # existing_label -> {new_label: (iou, iom, intersection)}
 
-        if not overlapping_new:
-            continue
+    both_nz = (ex_flat > 0) & (nw_flat > 0)
+    if both_nz.any():
+        ex_p = ex_flat[both_nz].astype(np.int64)
+        nw_p = nw_flat[both_nz].astype(np.int64)
+        stride = int(nw_p.max()) + 1
+        packed = ex_p * stride + nw_p
+        unique_packed, inter_counts = np.unique(packed, return_counts=True)
+        ex_u = (unique_packed // stride).tolist()
+        nw_u = (unique_packed % stride).tolist()
+        inter_list = inter_counts.tolist()
 
-        pair_ious = {}
-        for new_label in overlapping_new:
-            nw_mask = new_overlap == new_label
-            intersection = int(np.sum(ex_mask & nw_mask))
-            union = existing_areas[existing_label] + new_areas[new_label] - intersection
-            if union > 0:
-                pair_ious[new_label] = intersection / union
-        if pair_ious:
-            candidates[existing_label] = pair_ious
+        for e, n, inter in zip(ex_u, nw_u, inter_list):
+            ex_area = existing_areas.get(e)
+            nw_area = new_areas.get(n)
+            if ex_area is None or nw_area is None:
+                continue  # Label not in the active label set (shouldn't happen)
+            union = ex_area + nw_area - inter
+            iou = inter / union if union > 0 else 0.0
+            min_area = min(ex_area, nw_area)
+            iom = inter / min_area if min_area > 0 else 0.0
+            row_data = candidates.get(e)
+            if row_data is None:
+                row_data = {}
+                candidates[e] = row_data
+            row_data[n] = (iou, iom, inter)
 
-    # --- Centroid cache (lazy, computed from overlap region only) ---
-    centroid_cache_existing = {}
-    centroid_cache_new = {}
+    # --- Vectorized centroid precompute (single pass via weighted bincount) ---
+    # Only computes for labels actually present; tier-3 fallback consults these.
+    def _precompute_centroids(flat_labels, h, w, y_offset, x_offset, n_labels):
+        ys_grid, xs_grid = np.indices((h, w))
+        ys = ys_grid.ravel()
+        xs = xs_grid.ravel()
+        y_sum = np.bincount(flat_labels, weights=ys, minlength=n_labels)
+        x_sum = np.bincount(flat_labels, weights=xs, minlength=n_labels)
+        counts = np.bincount(flat_labels, minlength=n_labels).astype(np.float64)
+        safe_counts = np.where(counts > 0, counts, 1.0)
+        cy = y_sum / safe_counts + y_offset
+        cx = x_sum / safe_counts + x_offset
+        return cy, cx, counts
+
+    ex_h, ex_w = existing_overlap.shape
+    nw_h, nw_w = new_overlap.shape
+    ex_cy, ex_cx, ex_counts_for_centroid = _precompute_centroids(
+        ex_flat, ex_h, ex_w, overlap_y_start, overlap_x_start, ex_areas_arr.size,
+    )
+    nw_cy, nw_cx, nw_counts_for_centroid = _precompute_centroids(
+        nw_flat, nw_h, nw_w,
+        tile_overlap_y_start + tile_info.y_start,
+        tile_overlap_x_start + tile_info.x_start,
+        nw_areas_arr.size,
+    )
 
     def _get_existing_centroid(label):
-        if label not in centroid_cache_existing:
-            ys, xs = np.where(existing_overlap == label)
-            if len(ys) > 0:
-                # Convert overlap-local to image coords
-                centroid_cache_existing[label] = (
-                    float(np.mean(ys)) + overlap_y_start,
-                    float(np.mean(xs)) + overlap_x_start,
-                )
-            else:
-                centroid_cache_existing[label] = None
-        return centroid_cache_existing[label]
+        if label >= ex_counts_for_centroid.size or ex_counts_for_centroid[label] == 0:
+            return None
+        return (float(ex_cy[label]), float(ex_cx[label]))
 
     def _get_new_centroid(label):
-        if label not in centroid_cache_new:
-            ys, xs = np.where(new_overlap == label)
-            if len(ys) > 0:
-                # Convert tile-overlap-local to image coords
-                centroid_cache_new[label] = (
-                    float(np.mean(ys)) + tile_overlap_y_start + tile_info.y_start,
-                    float(np.mean(xs)) + tile_overlap_x_start + tile_info.x_start,
-                )
-            else:
-                centroid_cache_new[label] = None
-        return centroid_cache_new[label]
+        if label >= nw_counts_for_centroid.size or nw_counts_for_centroid[label] == 0:
+            return None
+        return (float(nw_cy[label]), float(nw_cx[label]))
 
     # --- Greedy matching ---
+    # Three tiers, scored so stronger evidence always outranks weaker:
+    #   Tier 1 (IoU primary):       score = 2.0 + iou        (>= 2.0)
+    #   Tier 2 (IoM containment):   score = 1.0 + iom        (in [1.0, 2.0])
+    #   Tier 3 (centroid fallback): score = 1.0 - dist/max   (in [0.0, 1.0))
     matches = []
     matched_new = set()
 
@@ -531,19 +558,28 @@ def match_cells_in_overlap(
         best_match = None
         best_score = -1.0
 
-        for new_label, iou in candidates[existing_label].items():
+        for new_label, (iou, iom, intersection) in candidates[existing_label].items():
             if new_label in matched_new:
                 continue
 
-            # Primary match: IoU threshold met
+            # Tier 1: IoU threshold met
             if iou >= iou_threshold:
-                score = iou + 1.0  # Offset to prioritize IoU matches
+                score = 2.0 + iou
                 if score > best_score:
                     best_score = score
                     best_match = new_label
                 continue
 
-            # Fallback: Centroid distance match (requires minimal overlap)
+            # Tier 2: Containment (IoM) — handles size-disparity / nested cells
+            if (iom >= containment_threshold
+                    and intersection >= min_containment_intersection):
+                score = 1.0 + iom
+                if score > best_score:
+                    best_score = score
+                    best_match = new_label
+                continue
+
+            # Tier 3: Centroid distance fallback (requires minimal overlap)
             if iou >= min_iou_for_centroid_match:
                 centroid_existing = _get_existing_centroid(existing_label)
                 centroid_new = _get_new_centroid(new_label)
@@ -573,6 +609,9 @@ def merge_tile_masks(
     iou_threshold: float = 0.5,
     max_centroid_distance: float = 50.0,
     min_iou_for_centroid_match: float = 0.01,
+    containment_threshold: float = 0.7,
+    min_containment_intersection: int = 100,
+    enable_late_match: bool = True,
 ) -> np.ndarray:
     """Merge segmented tile masks back into full image.
 
@@ -580,15 +619,19 @@ def merge_tile_masks(
     1. Create empty output mask of original shape
     2. Process tiles in order (top-left to bottom-right)
     3. For each tile:
-       a. Place non-overlap (core) region directly with new labels
-       b. For overlap regions with already-placed tiles:
-          - Find matching cells using hybrid IoU + centroid distance
-          - Assign consistent label to matched cells
+       a. Match cells in overlap regions against already-placed tiles using
+          a three-tier strategy (IoU → containment/IoM → centroid distance).
+       b. Optional late-match pass: for still-unmatched new cells, check
+          whether their overlap-region pixels are >= containment_threshold
+          contained inside a single existing label in the merged buffer;
+          if so, remap to that label (catches cases where the existing cell
+          extends mostly outside the overlap, so the overlap-clipped IoM
+          underestimates containment).
+       c. Place the full tile with mapped labels. Matched cells overwrite
+          the overlap (unifying across the boundary); unmatched new cells
+          fill only empty pixels in the overlap to preserve already-placed
+          neighbours, and overwrite freely in the tile's core region.
     4. Relabel to consecutive 1..N
-
-    The hybrid matching strategy prevents cell duplication at tile boundaries
-    by using centroid distance as a fallback when IoU is unreliable (e.g.,
-    when a cell has only a few pixels in the overlap region).
 
     Args:
         tile_masks: Dict mapping (row, col) to mask array
@@ -599,6 +642,16 @@ def merge_tile_masks(
             in pixels (default 50.0, ~1.5x typical cell diameter)
         min_iou_for_centroid_match: Minimum IoU required for centroid-based
             match to prevent matching completely disjoint cells (default 0.01)
+        containment_threshold: Minimum IoM (intersection / min-area) for the
+            containment matching tier (default 0.7). Catches "crescent"
+            artifacts where the same biological cell has very different mask
+            sizes across tiles.
+        min_containment_intersection: Minimum absolute intersection pixels
+            required for the containment tier (default 100).
+        enable_late_match: If True, run a placement-side late-match pass
+            that catches unmatched new cells whose overlap-region pixels are
+            largely contained inside a single existing cell's pixels in the
+            merged buffer. Defaults to True.
 
     Returns:
         Merged segmentation mask with consecutive labels 1..N
@@ -657,6 +710,8 @@ def merge_tile_masks(
                     iou_threshold,
                     max_centroid_distance,
                     min_iou_for_centroid_match,
+                    containment_threshold,
+                    min_containment_intersection,
                 )
 
                 for existing_label, new_label in matches:
@@ -684,12 +739,76 @@ def merge_tile_masks(
                     iou_threshold,
                     max_centroid_distance,
                     min_iou_for_centroid_match,
+                    containment_threshold,
+                    min_containment_intersection,
                 )
 
                 for existing_label, new_label in matches:
                     if new_label not in label_map:
                         label_map[new_label] = existing_label
                         matched_merged_labels.add(existing_label)
+
+        # Late-match pass: for cells still unmatched after IoU/IoM/centroid
+        # matching, check whether their pixels in the tile's overlap regions
+        # are largely contained inside a single existing label in `merged`.
+        # This catches crescent-bug cases where the existing cell's mass lies
+        # mostly outside the overlap, so the overlap-clipped IoM denominator
+        # would under-represent containment.
+        #
+        # Vectorized: one contingency table over the overlap-mask pixels
+        # instead of one full-tile mask per unmatched label.
+        if enable_late_match and (info.overlap_left > 0 or info.overlap_top > 0):
+            overlap_mask_tile = np.zeros(tile_mask.shape, dtype=bool)
+            if info.overlap_left > 0:
+                overlap_mask_tile[:, :info.overlap_left] = True
+            if info.overlap_top > 0:
+                overlap_mask_tile[:info.overlap_top, :] = True
+
+            dest_view = merged[info.y_start:info.y_end, info.x_start:info.x_end]
+
+            tile_at_overlap = tile_mask[overlap_mask_tile]
+            dest_at_overlap = dest_view[overlap_mask_tile]
+
+            tile_overlap_areas = np.bincount(tile_at_overlap.astype(np.int64))
+
+            both_nz = (tile_at_overlap > 0) & (dest_at_overlap > 0)
+            if both_nz.any():
+                t_p = tile_at_overlap[both_nz].astype(np.int64)
+                d_p = dest_at_overlap[both_nz].astype(np.int64)
+                stride = int(d_p.max()) + 1
+                packed = t_p * stride + d_p
+                u, cnt = np.unique(packed, return_counts=True)
+                ts = (u // stride)
+                ds = (u % stride)
+
+                # Group by tile label, pick dominant existing label per group
+                order = np.argsort(ts, kind="stable")
+                ts_s = ts[order]
+                ds_s = ds[order]
+                cnt_s = cnt[order]
+                breaks = np.concatenate((
+                    [0],
+                    np.where(np.diff(ts_s) != 0)[0] + 1,
+                    [len(ts_s)],
+                ))
+
+                for i in range(len(breaks) - 1):
+                    a, b = int(breaks[i]), int(breaks[i + 1])
+                    t_label = int(ts_s[a])
+                    if t_label in label_map:
+                        continue
+                    n_total = int(tile_overlap_areas[t_label]) if t_label < tile_overlap_areas.size else 0
+                    if n_total < min_containment_intersection:
+                        continue
+                    group_cnt = cnt_s[a:b]
+                    argmax = int(np.argmax(group_cnt))
+                    dominant_label = int(ds_s[a + argmax])
+                    dominant_count = int(group_cnt[argmax])
+
+                    if (dominant_count >= min_containment_intersection
+                            and dominant_count / n_total >= containment_threshold):
+                        label_map[t_label] = dominant_label
+                        matched_merged_labels.add(dominant_label)
 
         # Assign new labels to unmatched cells
         for label in tile_labels:
