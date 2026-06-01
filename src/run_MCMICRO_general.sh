@@ -65,6 +65,11 @@ log_warning() {
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] [WARNING] $*" | tee -a "$LOG_FILE"
 }
 
+# Log to file only (no terminal output) — for verbose per-item detail
+log_detail() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] [DETAIL] $*" >> "$LOG_FILE"
+}
+
 # Unified logging: prepends [DRY-RUN] in dry-run mode, writes to log file otherwise
 log_msg() {
     if [ "$DRY_RUN" = true ]; then
@@ -400,7 +405,7 @@ inject_background_ref() {
             log_warning "No suitable ST-B files found in $cycle_dir — skipping BGREF injection for this cycle"
             continue
         fi
-        log_info "  Cycle $cycle_num: using $chosen_filter for BGREF (${#stb_files[@]} tiles)"
+        log_detail "  Cycle $cycle_num: using $chosen_filter for BGREF (${#stb_files[@]} tiles)"
 
         # Determine highest exposure among chosen filter's ST-B files
         local he_stb="0"
@@ -464,41 +469,45 @@ preprocess_bgref_tiles() {
         for bgref_file in "$cycle_dir"/*_A-BGREF_*.tif; do
             [ -f "$bgref_file" ] || continue
             python3 -c "
-import tifffile, numpy as np
+import sys, tifffile, numpy as np
 from skimage.exposure import equalize_adapthist
 from skimage.filters import threshold_otsu
 
 path = '$bgref_file'
-# Read image and preserve OME metadata (macsima2mc needs it)
-with tifffile.TiffFile(path) as tif:
-    img = tif.pages[0].asarray()
-    description = tif.pages[0].description
-    description = description.encode('ascii', 'ignore').decode('ascii')
+try:
+    with tifffile.TiffFile(path) as tif:
+        img = tif.pages[0].asarray()
+        description = tif.pages[0].description
+        description = description.encode('ascii', 'ignore').decode('ascii')
 
-img_f = img.astype(np.float64)
-imax = np.iinfo(img.dtype).max if np.issubdtype(img.dtype, np.integer) else 1.0
-img_f /= imax
+    img_f = img.astype(np.float64)
+    imax = np.iinfo(img.dtype).max if np.issubdtype(img.dtype, np.integer) else 1.0
+    img_f /= imax
 
-# Otsu threshold to find tissue region — skip CLAHE on background-only tiles
-nonzero = img_f[img_f > 0]
-if len(nonzero) > 100:
-    thresh = threshold_otsu(nonzero)
-    tissue_mask = img_f > thresh * 0.5  # generous tissue boundary
-    tissue_frac = tissue_mask.sum() / tissue_mask.size
-else:
-    tissue_frac = 0.0
-    tissue_mask = np.zeros_like(img_f, dtype=bool)
+    # Otsu threshold to find tissue — use pre-binned histogram (NumPy 2.x compat)
+    nonzero = img_f[img_f > 0]
+    if len(nonzero) > 100 and nonzero.max() > nonzero.min():
+        counts, bin_edges = np.histogram(nonzero,
+            bins=np.linspace(float(nonzero.min()), float(nonzero.max()), 257))
+        bin_centers = (bin_edges[:-1] + bin_edges[1:]) / 2
+        thresh = threshold_otsu(hist=(counts, bin_centers))
+        tissue_mask = img_f > thresh * 0.5
+        tissue_frac = tissue_mask.sum() / tissue_mask.size
+    else:
+        tissue_frac = 0.0
+        tissue_mask = np.zeros_like(img_f, dtype=bool)
 
-if tissue_frac < 0.10:
-    # Mostly background — skip CLAHE to avoid amplifying noise
-    enhanced = img
-else:
-    # CLAHE on full image, then restore background to original (no noise amplification)
-    clahe = equalize_adapthist(img_f, clip_limit=0.03)
-    enhanced = (clahe * np.iinfo(np.uint16).max).astype(np.uint16)
-    enhanced[~tissue_mask] = img[~tissue_mask]
+    if tissue_frac < 0.10:
+        enhanced = img  # skip CLAHE — mostly background
+    else:
+        clahe = equalize_adapthist(img_f, clip_limit=0.03)
+        enhanced = (clahe * np.iinfo(np.uint16).max).astype(np.uint16)
+        enhanced[~tissue_mask] = img[~tissue_mask]
 
-tifffile.imwrite(path, enhanced, description=description)
+    tifffile.imwrite(path, enhanced, description=description)
+except Exception as e:
+    print(f'WARNING: CLAHE failed for {path}: {e}', file=sys.stderr)
+    # Leave original file unchanged on error
 "
             processed=$((processed + 1))
         done
@@ -641,7 +650,7 @@ if cleaned > 0:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerows(rows)
-" "$markers_csv" 2>&1 | while read -r line; do log_info "$line"; done
+" "$markers_csv" 2>&1 | while read -r line; do log_detail "$line"; done
     done < <(find "$staged_dir" -name "markers.csv" -type f)
 }
 
@@ -671,7 +680,7 @@ if cleared > 0:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerows(rows)
-" "$markers_csv" 2>&1 | while read -r line; do log_info "$line"; done
+" "$markers_csv" 2>&1 | while read -r line; do log_detail "$line"; done
     done < <(find "$staged_dir" -name "markers.csv" -type f)
 }
 
@@ -708,7 +717,7 @@ if marked > 0:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerows(rows)
-" "$markers_csv" 2>&1 | while read -r line; do log_info "$line"; done
+" "$markers_csv" 2>&1 | while read -r line; do log_detail "$line"; done
     done < <(find "$staged_dir" -name "markers.csv" -type f)
 }
 
@@ -752,7 +761,7 @@ removed = [f\"{r['marker_name']}(c{r.get('cycle_number','')})\" for r in rows
            if r.get('remove', '').upper() == 'TRUE']
 print(f'Channels kept ({len(kept)}): {chr(44).join(chr(32) + c for c in kept).lstrip()}')
 print(f'Channels removed ({len(removed)}): {chr(44).join(chr(32) + c for c in removed).lstrip()}')
-" "$markers_csv" 2>&1 | while read -r line; do log_info "$line"; done
+" "$markers_csv" 2>&1 | while read -r line; do log_detail "$line"; done
     done < <(find "$staged_dir" -name "markers.csv" -type f)
 }
 
@@ -812,7 +821,7 @@ if marked > 0:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerows(rows)
-" "$markers_csv" 2>&1 | while read -r line; do log_info "$line"; done
+" "$markers_csv" 2>&1 | while read -r line; do log_detail "$line"; done
         count=$((count + 1))
     done < <(find "$STAGING_BASE_DIR" -name "markers.csv" -type f)
 }
