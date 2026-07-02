@@ -832,8 +832,8 @@ import csv, sys
 
 path = sys.argv[1]
 ref_marker = sys.argv[2]
-# Parse comma-separated keep list into a set of ints (cycle 1 always kept)
-keep = {1}
+# Parse comma-separated list of extra cycles to keep (cycle 1 is always the reference)
+keep = set()
 for tok in sys.argv[3].split(','):
     tok = tok.strip()
     if tok:
@@ -844,24 +844,26 @@ with open(path) as f:
     fieldnames = reader.fieldnames
     rows = list(reader)
 
-removed = 0
-kept = 0
+kept = []
 for r in rows:
+    # Only the real per-cycle DAPI rows (bg_*_DAPI-DAPI rows have a different name)
     if r.get('marker_name', '') != ref_marker:
         continue
     cycle = int(r.get('cycle_number', 0))
+    if cycle == 1:
+        continue  # reference DAPI — must stay named '<ref>' and is already kept
     if cycle in keep:
-        r['remove'] = 'FALSE'
-        kept += 1
-    else:
-        r['remove'] = 'TRUE'
-        removed += 1
+        r['marker_name'] = f'{ref_marker}_cycle{cycle}'  # unique name -> retained as distinct channel
+        r['remove'] = ''                                 # blank = keep in final stack
+        kept.append(cycle)
 
-with open(path, 'w', newline='') as f:
-    writer = csv.DictWriter(f, fieldnames=fieldnames)
-    writer.writeheader()
-    writer.writerows(rows)
-print(f'Kept {kept} and removed {removed} {ref_marker} channels in {path} (keep cycles: {sorted(keep)})')
+if kept:
+    with open(path, 'w', newline='') as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames, lineterminator='\n')
+        writer.writeheader()
+        writer.writerows(rows)
+    print(f'Kept {len(kept)} extra {ref_marker} channel(s) in final stack, cycles {sorted(kept)} '
+          f'(renamed {ref_marker}_cycle<N>) in {path}')
 " "$markers_csv" "$REFERENCE_MARKER" "$keep_list" 2>&1 | while read -r line; do log_info "$line"; done
     done < <(find "$staged_dir" -name "markers.csv" -type f)
 }
@@ -1126,7 +1128,7 @@ process_roi() {
     # was freshly staged or staging was skipped; idempotent on re-run.
     if [ -n "$KEEP_DAPI_CYCLES" ]; then
         if [ "$DRY_RUN" = true ]; then
-            log_msg "  Would keep DAPI only for cycle 1 + cycles: $KEEP_DAPI_CYCLES (remove rest)"
+            log_msg "  Would additionally keep DAPI of cycles $KEEP_DAPI_CYCLES in final stack (as DAPI_cycle<N>)"
         else
             keep_dapi_cycles "$staged_dir" "$KEEP_DAPI_CYCLES"
         fi
@@ -1273,7 +1275,7 @@ print_config_summary() {
         log_msg "Recompute mode:     YES (force re-stage and re-process)"
     fi
     if [ -n "$KEEP_DAPI_CYCLES" ]; then
-        log_msg "Keep DAPI for cycles: 1,$KEEP_DAPI_CYCLES (remove all other DAPI)"
+        log_msg "Keep extra DAPI in final stack for cycles: $KEEP_DAPI_CYCLES (as DAPI_cycle<N>; reference cycle 1 always kept)"
     fi
     echo ""
 
@@ -1471,8 +1473,9 @@ Optional arguments:
   -he                         Same as --highest-exposure-only
   --cleanup-staged            Delete staged raw data after successful processing
   --recompute                 Force re-staging and re-processing (ignore existing data)
-  --keep-dapi <cycles>        Keep DAPI only for cycle 1 + these cycles (comma-separated);
-                              mark all other cycles' DAPI as remove=TRUE
+  --keep-dapi <cycles>        Additionally retain these cycles' DAPI in the final stitched
+                              stack (comma-separated), each renamed DAPI_cycle<N>. The
+                              reference DAPI (cycle 1) is always kept. Does not affect alignment.
   --help, -h                  Show this help message
 
 Examples:
