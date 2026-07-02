@@ -26,6 +26,7 @@ REFERENCE_MARKER="DAPI"
 EXPERIMENT_FILTER=""
 CLEANUP_STAGED=false
 RECOMPUTE=false
+KEEP_DAPI_CYCLES=""   # Comma-separated cycle numbers whose DAPI to keep (cycle 1 always kept)
 KEEP_BACKGROUND_CHANNELS=false
 
 # Config paths (set via CLI flags or environment variables)
@@ -817,6 +818,54 @@ if marked > 0:
     done < <(find "$STAGING_BASE_DIR" -name "markers.csv" -type f)
 }
 
+# Keep the reference (DAPI) channel only for cycle 1 + a user-specified set of cycles;
+# mark every other cycle's DAPI as remove=TRUE. Independent of the scan-DAPI workflow.
+keep_dapi_cycles() {
+    local staged_dir="$1"
+    local keep_list="$2"
+
+    local markers_csv
+    while IFS= read -r markers_csv; do
+        [ -f "$markers_csv" ] || continue
+        python3 -c "
+import csv, sys
+
+path = sys.argv[1]
+ref_marker = sys.argv[2]
+# Parse comma-separated keep list into a set of ints (cycle 1 always kept)
+keep = {1}
+for tok in sys.argv[3].split(','):
+    tok = tok.strip()
+    if tok:
+        keep.add(int(tok))
+
+with open(path) as f:
+    reader = csv.DictReader(f)
+    fieldnames = reader.fieldnames
+    rows = list(reader)
+
+removed = 0
+kept = 0
+for r in rows:
+    if r.get('marker_name', '') != ref_marker:
+        continue
+    cycle = int(r.get('cycle_number', 0))
+    if cycle in keep:
+        r['remove'] = 'FALSE'
+        kept += 1
+    else:
+        r['remove'] = 'TRUE'
+        removed += 1
+
+with open(path, 'w', newline='') as f:
+    writer = csv.DictWriter(f, fieldnames=fieldnames)
+    writer.writeheader()
+    writer.writerows(rows)
+print(f'Kept {kept} and removed {removed} {ref_marker} channels in {path} (keep cycles: {sorted(keep)})')
+" "$markers_csv" "$REFERENCE_MARKER" "$keep_list" 2>&1 | while read -r line; do log_info "$line"; done
+    done < <(find "$staged_dir" -name "markers.csv" -type f)
+}
+
 # Return the highest-exposure directory under base_dir, or base_dir itself.
 get_highest_exposure_dir() {
     local base_dir="$1"
@@ -1073,6 +1122,16 @@ process_roi() {
         fi
     fi
 
+    # Keep only the requested cycles' DAPI (cycle 1 always kept). Runs whether the ROI
+    # was freshly staged or staging was skipped; idempotent on re-run.
+    if [ -n "$KEEP_DAPI_CYCLES" ]; then
+        if [ "$DRY_RUN" = true ]; then
+            log_msg "  Would keep DAPI only for cycle 1 + cycles: $KEEP_DAPI_CYCLES (remove rest)"
+        else
+            keep_dapi_cycles "$staged_dir" "$KEEP_DAPI_CYCLES"
+        fi
+    fi
+
     # Resolve the actual directory to feed into MCMICRO
     local mcmicro_input_dir
     mcmicro_input_dir=$(get_highest_exposure_dir "$staged_dir")
@@ -1212,6 +1271,9 @@ print_config_summary() {
     fi
     if [ "$RECOMPUTE" = true ]; then
         log_msg "Recompute mode:     YES (force re-stage and re-process)"
+    fi
+    if [ -n "$KEEP_DAPI_CYCLES" ]; then
+        log_msg "Keep DAPI for cycles: 1,$KEEP_DAPI_CYCLES (remove all other DAPI)"
     fi
     echo ""
 
@@ -1371,6 +1433,10 @@ while [[ $# -gt 0 ]]; do
             RECOMPUTE=true
             shift
             ;;
+        --keep-dapi)
+            KEEP_DAPI_CYCLES="$2"
+            shift 2
+            ;;
         --help|-h)
             cat <<EOF
 MACSima Pipeline - Staging and MCMICRO Processing
@@ -1405,6 +1471,8 @@ Optional arguments:
   -he                         Same as --highest-exposure-only
   --cleanup-staged            Delete staged raw data after successful processing
   --recompute                 Force re-staging and re-processing (ignore existing data)
+  --keep-dapi <cycles>        Keep DAPI only for cycle 1 + these cycles (comma-separated);
+                              mark all other cycles' DAPI as remove=TRUE
   --help, -h                  Show this help message
 
 Examples:
