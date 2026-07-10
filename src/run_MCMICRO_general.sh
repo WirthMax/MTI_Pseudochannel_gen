@@ -204,6 +204,17 @@ is_already_staged() {
     return 1
 }
 
+# An ROI counts as "MCMICRO complete" once backsub output exists. MCMICRO writes
+# background/*.ome.tif into the --in project dir, which lives inside the staged dir
+# (possibly under an exposure subfolder), so search recursively. Survives even when
+# --cleanup-staged has removed raw/, since background/ is not deleted.
+is_mcmicro_complete() {
+    local staged_dir="$1"
+    local hit
+    hit=$(find "$staged_dir" -type f -path '*/background/*.ome.tif*' -print -quit 2>/dev/null || true)
+    [ -n "$hit" ]
+}
+
 swap_scan_dapi_into_cycle1() {
     local roi_path="$1"
     local scan_dir="${roi_path}/3_Scan2"
@@ -1062,6 +1073,19 @@ process_roi() {
 
     log_msg "Processing ROI: $roi_name"
 
+    # Skip everything if MCMICRO already completed for this ROI (backsub output present),
+    # unless --recompute forces a full re-run. Lets a partially-failed experiment be
+    # re-run so only the not-yet-done ROIs are (re)processed.
+    if [ "$RECOMPUTE" = false ] && is_mcmicro_complete "$staged_dir"; then
+        if [ "$DRY_RUN" = true ]; then
+            log_msg "  MCMICRO output already exists, would skip ROI: $roi_name"
+        else
+            log_msg "  MCMICRO output already exists, skipping ROI: $roi_name"
+            echo "$roi_name,ALREADY_DONE,$(date '+%Y-%m-%d %H:%M:%S')" >> "${LOG_FILE%.log}_summary.csv"
+        fi
+        return 0
+    fi
+
     # Stage the ROI (skip if already staged, unless --recompute)
     if is_already_staged "$staged_dir" && [ "$RECOMPUTE" = false ]; then
         log_msg "  Staging already exists, skipping: $staged_dir"
@@ -1472,7 +1496,10 @@ Optional arguments:
   --highest-exposure-only     Use only highest exposure in staging (-he flag)
   -he                         Same as --highest-exposure-only
   --cleanup-staged            Delete staged raw data after successful processing
-  --recompute                 Force re-staging and re-processing (ignore existing data)
+  --recompute                 Force re-staging and re-running MCMICRO even when output exists.
+                              Without this flag, ROIs whose backsub output already exists
+                              (background/*.ome.tif) are skipped, so a partially-failed
+                              experiment can be re-run to process only the not-yet-done ROIs.
   --keep-dapi <cycles>        Additionally retain these cycles' DAPI in the final stitched
                               stack (comma-separated), each renamed DAPI_cycle<N>. The
                               reference DAPI (cycle 1) is always kept. Does not affect alignment.
