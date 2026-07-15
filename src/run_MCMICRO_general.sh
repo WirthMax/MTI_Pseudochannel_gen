@@ -459,6 +459,23 @@ with open(path) as f:
     fieldnames = reader.fieldnames
     rows = list(reader)
 
+# Per-cycle lookup of DAPI background rows (macsima2mc emits these as
+# 'bg_*_DAPI-DAPI'). backsub subtracts the channel named in 'background', so a
+# kept DAPI must point at its own cycle's DAPI background to be subtracted.
+dapi_bg_by_cycle = {}
+for r in rows:
+    name = r.get('marker_name', '')
+    if name == ref_marker:
+        continue  # real DAPI rows, not backgrounds
+    # A DAPI background row: a non-reference row that still references DAPI and
+    # is a bg_* channel. Discriminates against the real DAPI + other markers.
+    if 'DAPI' in name.upper() and name.lower().startswith('bg'):
+        try:
+            c = int(r.get('cycle_number', 0))
+        except (ValueError, TypeError):
+            continue
+        dapi_bg_by_cycle[c] = name
+
 kept = []
 for r in rows:
     # Only the real per-cycle DAPI rows (bg_*_DAPI-DAPI rows have a different name)
@@ -470,6 +487,12 @@ for r in rows:
     if cycle in keep:
         r['marker_name'] = f'{ref_marker}_cycle{cycle}'  # unique name -> retained as distinct channel
         r['remove'] = ''                                 # blank = keep in final stack
+        bg = dapi_bg_by_cycle.get(cycle, '')
+        if bg:
+            r['background'] = bg   # backsub will subtract this cycle's DAPI background
+        else:
+            print(f'WARNING: no DAPI background row found for cycle {cycle}; '
+                  f'{ref_marker}_cycle{cycle} will NOT be background-subtracted')
         kept.append(cycle)
 
 if kept:
