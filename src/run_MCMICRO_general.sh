@@ -196,12 +196,21 @@ matches_experiment_filter() {
     return 1
 }
 
-is_already_staged() {
+# Staging is complete only when the resolved MCMICRO input dir has markers.csv.
+# A non-empty staged dir WITHOUT markers.csv is a partial/interrupted stage.
+is_staging_complete() {
     local staged_dir="$1"
-    if [ -d "$staged_dir" ] && [ -n "$(ls -A "$staged_dir" 2>/dev/null)" ]; then
-        return 0
-    fi
-    return 1
+    [ -d "$staged_dir" ] || return 1
+    local input_dir
+    input_dir=$(get_highest_exposure_dir "$staged_dir")
+    [ -f "$input_dir/markers.csv" ]
+}
+
+# MCMICRO is complete for an ROI once it has written its registration output
+# into the resolved input dir (coarse per-ROI resume marker).
+is_mcmicro_complete() {
+    local input_dir="$1"
+    [ -d "$input_dir/registration" ] && [ -n "$(ls -A "$input_dir/registration" 2>/dev/null)" ]
 }
 
 # An ROI counts as "MCMICRO complete" once backsub output exists. MCMICRO writes
@@ -1096,28 +1105,21 @@ process_roi() {
 
     log_msg "Processing ROI: $roi_name"
 
-    # Skip everything if MCMICRO already completed for this ROI (backsub output present),
-    # unless --recompute forces a full re-run. Lets a partially-failed experiment be
-    # re-run so only the not-yet-done ROIs are (re)processed.
-    if [ "$RECOMPUTE" = false ] && is_mcmicro_complete "$staged_dir"; then
-        if [ "$DRY_RUN" = true ]; then
-            log_msg "  MCMICRO output already exists, would skip ROI: $roi_name"
-        else
-            log_msg "  MCMICRO output already exists, skipping ROI: $roi_name"
-            echo "$roi_name,ALREADY_DONE,$(date '+%Y-%m-%d %H:%M:%S')" >> "${LOG_FILE%.log}_summary.csv"
-        fi
-        return 0
-    fi
-
-    # Stage the ROI (skip if already staged, unless --recompute)
-    if is_already_staged "$staged_dir" && [ "$RECOMPUTE" = false ]; then
-        log_msg "  Staging already exists, skipping: $staged_dir"
+    # Stage the ROI. "Complete" = markers.csv present in the resolved input dir;
+    # a partial stage (no markers.csv) is redone. --recompute always re-stages.
+    if is_staging_complete "$staged_dir" && [ "$RECOMPUTE" = false ]; then
+        log_msg "  Staging complete (markers.csv present), skipping: $staged_dir"
     else
-        if [ "$RECOMPUTE" = true ] && [ -d "$staged_dir" ]; then
+        # About to (re)stage — clear any partial/previous output so macsima2mc
+        # starts clean instead of appending to a half-staged dir.
+        if [ -d "$staged_dir" ]; then
             if [ "$DRY_RUN" = true ]; then
-                log_msg "  Would remove existing staged dir for recompute: $staged_dir"
-            else
+                log_msg "  Would remove existing staged dir before (re)staging: $staged_dir"
+            elif [ "$RECOMPUTE" = true ]; then
                 log_info "  Removing existing staged dir for recompute: $staged_dir"
+                rm -rf "$staged_dir"
+            else
+                log_warning "  Staging incomplete (no markers.csv) — removing partial staged dir before re-staging: $staged_dir"
                 rm -rf "$staged_dir"
             fi
         fi
@@ -1185,6 +1187,15 @@ process_roi() {
     local mcmicro_input_dir
     mcmicro_input_dir=$(get_highest_exposure_dir "$staged_dir")
     log_msg "  Resolved MCMICRO input: $mcmicro_input_dir"
+
+    # Skip MCMICRO if it already produced registration output (unless --recompute).
+    if [ "$RECOMPUTE" = false ] && is_mcmicro_complete "$mcmicro_input_dir"; then
+        log_success "  MCMICRO already complete (registration/ present), skipping: $roi_name"
+        if [ "$DRY_RUN" = false ]; then
+            echo "$roi_name,ALREADY_COMPLETE,$(date '+%Y-%m-%d %H:%M:%S')" >> "${LOG_FILE%.log}_summary.csv"
+        fi
+        return 0
+    fi
 
     # Run MCMICRO
     if ! run_mcmicro "$mcmicro_input_dir" "$roi_name"; then
