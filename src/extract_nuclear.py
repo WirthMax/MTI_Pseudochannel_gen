@@ -10,8 +10,16 @@ finds under the supplied path:
      in the image's OME-XML when those are present.
   2. Reads only that one plane -- peak memory is roughly one channel, not the whole
      stack, so a 56 GB / N-channel image only needs ~(56/N) GB of RAM.
-  3. Writes it, tiled and (by default) losslessly compressed, to
-     ``<roi>/Nuclear/<sample>_<marker>.ome.tif``, preserving dtype and pixel size.
+  3. Writes it, tiled and (by default) losslessly compressed, preserving dtype
+     and pixel size. Output naming keys on the experiment folder so the same
+     rack/well/ROI in different experiments never collides:
+       - MACSIMA layout: named after the ``*_staged`` experiment folder --
+         ``<experiment>_<marker>.ome.tif`` (that folder already encodes
+         rack/well/ROI).
+       - otherwise: ``<sample>_<marker>.ome.tif``, with an ``_1``/``_2`` suffix
+         appended on collision (non-overwrite mode) so no source is skipped.
+     By default each file lands in a per-ROI sibling ``<roi>/Nuclear/`` folder;
+     pass ``--out-dir`` to consolidate every experiment's output into one folder.
 
 Indexing note
 -------------
@@ -344,12 +352,48 @@ def sample_stem(tif_path: Path) -> str:
     return name
 
 
+def find_experiment_name(background_dir: Path) -> str | None:
+    """Return the nearest ancestor directory name ending in '_staged' (the
+    macsima2mc staged experiment folder), or None if the tree does not follow the
+    MACSIMA layout. This folder name uniquely identifies the experiment and
+    already encodes rack/well/ROI (e.g. ``..._R2_B1_ROI3_staged``)."""
+    for parent in background_dir.parents:
+        if parent.name.endswith("_staged"):
+            return parent.name
+    return None
+
+
+def resolve_out_path(
+    out_dir: Path, base: str, marker: str, overwrite: bool, taken: set[Path]
+) -> Path:
+    """Compose ``<base>_<marker>.ome.tif`` in *out_dir*. In non-overwrite mode,
+    append ``_1``, ``_2``, ... when a distinct source in THIS run already claimed
+    the name, so colliding non-MACSIMA leaves each get their own file instead of
+    being skipped. *taken* accumulates chosen paths across jobs within one run.
+
+    Jobs run in a deterministic sorted order (see ``find_background_dirs``), so
+    the N-th colliding source always receives the same ``_N`` suffix; re-running
+    therefore still skips already-extracted files (resumability preserved) while
+    never dropping a distinct source."""
+    stem = f"{base}_{marker}"
+    candidate = out_dir / f"{stem}.ome.tif"
+    if not overwrite:
+        n = 0
+        while candidate in taken:
+            n += 1
+            candidate = out_dir / f"{stem}_{n}.ome.tif"
+    taken.add(candidate)
+    return candidate
+
+
 def process_job(
     job: Job,
     channel: str,
     ignore_case: bool,
     force_index: int | None,
     out_dir_name: str,
+    consolidated_out_dir: Path | None,
+    taken: set[Path],
     compression: str | None,
     tile: int,
     overwrite: bool,
@@ -395,8 +439,10 @@ def process_job(
                   f"(csv row {row.row_index}, channel_number "
                   f"{row.channel_number})")
 
-        out_dir = job.roi_dir / out_dir_name
-        out_path = out_dir / f"{sample_stem(job.tif_path)}_{channel}.ome.tif"
+        out_dir = consolidated_out_dir or (job.roi_dir / out_dir_name)
+        exp = find_experiment_name(job.background_dir)
+        name_base = exp if exp else sample_stem(job.tif_path)
+        out_path = resolve_out_path(out_dir, name_base, channel, overwrite, taken)
 
         if out_path.exists() and not overwrite:
             print(f"    skip: {out_path} exists (use --overwrite)")
@@ -439,14 +485,23 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("channel", help="Marker name to extract (e.g. DAPI).")
     p.add_argument(
-        "path",
+        "--path",
         type=Path,
         help="A background/ folder, an ROI folder, or a tree to search.",
     )
     p.add_argument(
         "--out-dir-name",
         default="Nuclear",
-        help="Name of the sibling output folder (default: Nuclear).",
+        help="Name of the per-ROI sibling output folder (default: Nuclear). "
+        "Ignored when --out-dir is given.",
+    )
+    p.add_argument(
+        "--out-dir",
+        type=Path,
+        default=None,
+        help="Write ALL outputs into this single directory instead of a per-ROI "
+        "Nuclear/ folder. Filenames are made unique from the experiment folder "
+        "name (MACSIMA '*_staged' parent) or, for non-MACSIMA trees, enumerated.",
     )
     p.add_argument(
         "--csv-name",
@@ -517,6 +572,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     print(f"Found {len(jobs)} background folder(s).\n")
     written = 0
     failed = 0
+    taken: set[Path] = set()
     for job in jobs:
         try:
             if process_job(
@@ -525,6 +581,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 ignore_case=args.ignore_case,
                 force_index=args.force_index,
                 out_dir_name=args.out_dir_name,
+                consolidated_out_dir=args.out_dir,
+                taken=taken,
                 compression=compression,
                 tile=args.tile,
                 overwrite=args.overwrite,
