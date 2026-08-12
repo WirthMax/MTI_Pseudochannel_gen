@@ -31,6 +31,10 @@ from .superpixels import (
 )
 
 
+# Dropdown label for thresholding on the summed signal across all channels.
+_TOTAL_SIGNAL_OPTION = "total signal (all)"
+
+
 def _check_ipywidgets():
     """Ensure the interactive UI dependencies are available."""
     if widgets is None:
@@ -94,8 +98,10 @@ class SuperpixelExplorer:
         self._scale_y, self._scale_x = get_preview_scale(
             self.full_shape, self._preview_shape
         )
-        # Single-slot cache for the currently displayed individual channel.
-        self._display_cache: tuple[Optional[str], Optional[np.ndarray]] = (None, None)
+        # Small bounded cache of per-channel thumbnails (display + threshold
+        # channels), so we never retain more than a couple at once.
+        self._chan_cache: dict[str, np.ndarray] = {}
+        self._chan_cache_max = 3
 
         # Persistent figure/artist handles (created once in display()).
         self._fig = None
@@ -117,9 +123,16 @@ class SuperpixelExplorer:
             value=False, description="Remove empty superpixels",
             indent=False, layout=widgets.Layout(width="230px"),
         )
-        # Absolute cutoff on per-superpixel total signal. Range spans up to the
-        # 99th percentile of the summed-signal thumbnail (a usable upper bound).
-        thresh_max = float(np.percentile(self._signal_thumb, 99)) or 1.0
+        # Which channel drives the empty filter (default: summed signal).
+        self.threshold_channel_dropdown = widgets.Dropdown(
+            options=[_TOTAL_SIGNAL_OPTION] + self.marker_names,
+            value=_TOTAL_SIGNAL_OPTION, description="Threshold on",
+            style={"description_width": "90px"},
+            layout=widgets.Layout(width="260px"),
+        )
+        # Absolute cutoff on the chosen signal. Range spans up to the 99th
+        # percentile of that signal's thumbnail (a usable upper bound).
+        thresh_max = self._thresh_slider_max()
         self.threshold_slider = widgets.FloatSlider(
             value=0.0, min=0.0, max=thresh_max, step=thresh_max / 200 or 0.01,
             description="Empty ≤", continuous_update=False,
@@ -141,7 +154,8 @@ class SuperpixelExplorer:
 
         controls = widgets.VBox([
             widgets.HBox([self.size_slider, self.display_dropdown]),
-            widgets.HBox([self.remove_empty_toggle, self.threshold_slider]),
+            widgets.HBox([self.remove_empty_toggle, self.threshold_channel_dropdown]),
+            widgets.HBox([self.threshold_slider]),
             widgets.HBox([self.export_button, self.status]),
         ])
         self.main_widget = widgets.VBox([
@@ -154,27 +168,57 @@ class SuperpixelExplorer:
         self.size_slider.observe(self._on_change, names="value")
         self.remove_empty_toggle.observe(self._on_toggle_empty, names="value")
         self.threshold_slider.observe(self._on_change, names="value")
+        self.threshold_channel_dropdown.observe(self._on_threshold_channel_change, names="value")
         self.display_dropdown.observe(self._on_change, names="value")
         self.export_button.on_click(self._on_export_click)
 
+    def _thresh_slider_max(self) -> float:
+        """99th-percentile upper bound of the currently selected threshold
+        signal thumbnail."""
+        return float(np.percentile(self._threshold_signal_thumb(), 99)) or 1.0
+
     def _on_toggle_empty(self, change):
         self.threshold_slider.disabled = not change["new"]
+        self._render()
+
+    def _on_threshold_channel_change(self, change):
+        # Re-scale the slider range to the newly selected signal, then redraw.
+        new_max = self._thresh_slider_max()
+        if new_max >= self.threshold_slider.max:
+            self.threshold_slider.max = new_max
+        else:
+            self.threshold_slider.value = min(self.threshold_slider.value, new_max)
+            self.threshold_slider.max = new_max
+        self.threshold_slider.step = new_max / 200 or 0.01
         self._render()
 
     def _on_change(self, change):
         self._render()
 
     # -------------------------------------------------------------- render ---
+    def _get_channel_thumb(self, name: str) -> np.ndarray:
+        """Lazily downsample a single channel, bounded-cached."""
+        if name not in self._chan_cache:
+            if len(self._chan_cache) >= self._chan_cache_max:
+                self._chan_cache.pop(next(iter(self._chan_cache)))  # evict oldest
+            self._chan_cache[name] = downsample_image(
+                self.channels[name], self.display_target
+            )
+        return self._chan_cache[name]
+
     def _background_thumb(self) -> np.ndarray:
         choice = self.display_dropdown.value
         if choice == "max projection":
             return self._max_proj
-        # Lazily downsample the requested channel; single-slot cache so we never
-        # retain more than one per-channel thumbnail.
-        if self._display_cache[0] != choice:
-            thumb = downsample_image(self.channels[choice], self.display_target)
-            self._display_cache = (choice, thumb)
-        return self._display_cache[1]
+        return self._get_channel_thumb(choice)
+
+    def _threshold_signal_thumb(self) -> np.ndarray:
+        """Thumbnail whose per-superpixel mean drives the empty filter: the
+        summed signal, or a single channel when one is selected."""
+        choice = self.threshold_channel_dropdown.value
+        if choice == _TOTAL_SIGNAL_OPTION:
+            return self._signal_thumb
+        return self._get_channel_thumb(choice)
 
     def _kept_cells(self, size: int):
         """Compute the kept-superpixel mask on the thumbnail (preview approx).
@@ -193,10 +237,11 @@ class SuperpixelExplorer:
         size_thumb = max(1, int(round(size * (self._scale_y + self._scale_x) / 2)))
         thumb_labels, _, _ = build_superpixel_labels(self._preview_shape, size_thumb)
 
+        signal_thumb = self._threshold_signal_thumb()
         flat = thumb_labels.ravel()
         minlength = int(flat.max()) + 1
         counts = np.bincount(flat, minlength=minlength)
-        sums = np.bincount(flat, weights=self._signal_thumb.ravel(), minlength=minlength)
+        sums = np.bincount(flat, weights=signal_thumb.ravel(), minlength=minlength)
         with np.errstate(divide="ignore", invalid="ignore"):
             means = np.nan_to_num(sums / counts, nan=0.0)
 
@@ -272,9 +317,10 @@ class SuperpixelExplorer:
 
         if self.remove_empty_toggle.value:
             n_kept = int(round(kept_fraction * n_total))
+            src = self.threshold_channel_dropdown.value
             self.status.value = (
                 f"<b>{n_total}</b> superpixels ({size}px) &middot; keeping "
-                f"<b>{n_kept}</b> (~{kept_fraction * 100:.0f}%, signal &gt; {self.threshold_slider.value:.3f})"
+                f"<b>{n_kept}</b> (~{kept_fraction * 100:.0f}%, {src} &gt; {self.threshold_slider.value:.3f})"
             )
         else:
             self.status.value = f"<b>{n_total}</b> superpixels ({size}px)"
@@ -309,12 +355,15 @@ class SuperpixelExplorer:
         size = self.size_slider.value
         remove_empty = self.remove_empty_toggle.value
         empty_threshold = self.threshold_slider.value
+        choice = self.threshold_channel_dropdown.value
+        threshold_marker = None if choice == _TOTAL_SIGNAL_OPTION else choice
 
         df = extract_superpixel_features(
             self.channels,
             size=size,
             remove_empty=remove_empty,
             empty_threshold=empty_threshold,
+            threshold_marker=threshold_marker,
         )
         self.features_df = df
 

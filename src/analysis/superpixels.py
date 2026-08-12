@@ -183,6 +183,7 @@ def extract_superpixel_features(
     remove_empty: bool = False,
     empty_threshold: float = 0.0,
     empty_percentile: Optional[float] = None,
+    threshold_marker: Optional[str] = None,
     roi_name: Optional[str] = None,
 ) -> pd.DataFrame:
     """Compute a superpixel feature table from multi-channel image data.
@@ -193,7 +194,10 @@ def extract_superpixel_features(
         size: Superpixel square side length in pixels.
         markers: Markers to aggregate. If None, uses all channel keys.
         stats: Statistics per marker (subset of "mean", "sum", "std").
-        remove_empty: If True, drop superpixels whose ``total_signal`` is at or
+        threshold_marker: If given, base the empty filter on this marker's mean
+            intensity (``{marker}_mean``) instead of ``total_signal`` (the sum
+            of all per-marker means). Requires "mean" in ``stats``.
+        remove_empty: If True, drop superpixels whose signal is at or
             below the cutoff (background / low-signal regions).
         empty_percentile: If given (0-100), the cutoff is this percentile of
             ``total_signal`` across all superpixels (adaptive), taking precedence
@@ -269,8 +273,18 @@ def extract_superpixel_features(
     df = pd.DataFrame(data)
 
     if remove_empty:
-        cutoff = _empty_cutoff(total_signal, empty_threshold, empty_percentile)
-        df = df[df["total_signal"] > cutoff].reset_index(drop=True)
+        if threshold_marker is not None:
+            col = f"{threshold_marker}_mean"
+            if col not in df.columns:
+                raise ValueError(
+                    f"threshold_marker '{threshold_marker}' requires its mean column "
+                    f"'{col}'; include 'mean' in stats and pass a valid marker name."
+                )
+            signal = df[col].to_numpy()
+        else:
+            signal = total_signal
+        cutoff = _empty_cutoff(signal, empty_threshold, empty_percentile)
+        df = df[signal > cutoff].reset_index(drop=True)
 
     if roi_name is not None:
         df.insert(0, "ROI", roi_name)
@@ -284,24 +298,28 @@ def build_superpixel_mask(
     remove_empty: bool = False,
     empty_threshold: float = 0.0,
     empty_percentile: Optional[float] = None,
+    threshold_marker: Optional[str] = None,
     markers: Optional[list[str]] = None,
 ) -> np.ndarray:
     """Build a superpixel label image, optionally dropping empty regions.
 
     Each square gets a unique label (row-major, 1..N). When ``remove_empty`` is
-    set, superpixels whose ``total_signal`` (sum of per-marker mean intensities)
-    is at or below the cutoff are set to 0 (background). Retained superpixels
-    keep their original label IDs, so the mask lines up with the ``label``
-    column of :func:`extract_superpixel_features`.
+    set, superpixels whose signal is at or below the cutoff are set to 0
+    (background). The signal is ``total_signal`` (sum of per-marker mean
+    intensities) unless ``threshold_marker`` selects a single marker's mean.
+    Retained superpixels keep their original label IDs, so the mask lines up
+    with the ``label`` column of :func:`extract_superpixel_features`.
 
     Args:
         channels: Dict-like of marker_name -> 2D array (e.g. OMETiffChannels).
         size: Superpixel square side length in pixels.
         remove_empty: If True, zero out empty superpixels.
-        empty_percentile: If given (0-100), cutoff is this percentile of
-            total_signal (adaptive), taking precedence over empty_threshold.
-        empty_threshold: Absolute total_signal cutoff (used when
-            empty_percentile is None).
+        empty_percentile: If given (0-100), cutoff is this percentile of the
+            signal (adaptive), taking precedence over empty_threshold.
+        empty_threshold: Absolute signal cutoff (used when empty_percentile
+            is None).
+        threshold_marker: If given, threshold on this marker's mean intensity
+            instead of total_signal.
         markers: Markers used to compute total_signal. If None, uses all.
 
     Returns:
@@ -309,6 +327,8 @@ def build_superpixel_mask(
     """
     if markers is None:
         markers = list(channels.keys())
+    if threshold_marker is not None and threshold_marker not in markers:
+        markers = list(markers) + [threshold_marker]
 
     if isinstance(channels, OMETiffChannels):
         shape = channels.shape
@@ -326,14 +346,22 @@ def build_superpixel_mask(
     if len(labels) == 0:
         return label_img
 
-    mean_cols = [c for c in stat_arrays if c.endswith("_mean")]
-    if mean_cols:
-        total_signal = np.sum([stat_arrays[c] for c in mean_cols], axis=0)
+    if threshold_marker is not None:
+        mkey = f"{threshold_marker}_mean"
+        if mkey not in stat_arrays:
+            raise ValueError(
+                f"threshold_marker '{threshold_marker}' not found among channels."
+            )
+        signal = stat_arrays[mkey]
     else:
-        total_signal = np.zeros(len(labels), dtype=np.float64)
+        mean_cols = [c for c in stat_arrays if c.endswith("_mean")]
+        if mean_cols:
+            signal = np.sum([stat_arrays[c] for c in mean_cols], axis=0)
+        else:
+            signal = np.zeros(len(labels), dtype=np.float64)
 
-    cutoff = _empty_cutoff(total_signal, empty_threshold, empty_percentile)
-    keep = labels[total_signal > cutoff]
+    cutoff = _empty_cutoff(signal, empty_threshold, empty_percentile)
+    keep = labels[signal > cutoff]
     return _apply_keep_lut(label_img, keep)
 
 
@@ -432,6 +460,7 @@ def compute_superpixel_features(
     remove_empty: bool = False,
     empty_threshold: float = 0.0,
     empty_percentile: Optional[float] = None,
+    threshold_marker: Optional[str] = None,
     roi_name: Optional[str] = None,
     output_path: Optional[Union[str, Path]] = None,
     save_masks: bool = False,
@@ -453,9 +482,11 @@ def compute_superpixel_features(
         markers: Markers to aggregate. If None, uses all channels.
         stats: Statistics per marker (subset of "mean", "sum", "std").
         remove_empty: Drop empty superpixels (see extract_superpixel_features).
-        empty_percentile: If given (0-100), adaptive percentile cutoff on
-            total_signal (takes precedence over empty_threshold).
-        empty_threshold: Absolute total_signal cutoff for the empty filter.
+        empty_percentile: If given (0-100), adaptive percentile cutoff on the
+            signal (takes precedence over empty_threshold).
+        empty_threshold: Absolute signal cutoff for the empty filter.
+        threshold_marker: If given, threshold on this marker's mean intensity
+            instead of total_signal.
         roi_name: Optional ROI identifier column.
         output_path: If given, write the feature table as CSV here.
         save_masks: If True, write the superpixel masks (see mask_* args). When
@@ -487,6 +518,7 @@ def compute_superpixel_features(
             remove_empty=remove_empty,
             empty_threshold=empty_threshold,
             empty_percentile=empty_percentile,
+            threshold_marker=threshold_marker,
             roi_name=roi_name,
         )
         shape = channels.shape
@@ -529,6 +561,7 @@ def compute_superpixel_features_batch(
     remove_empty: bool = False,
     empty_threshold: float = 0.0,
     empty_percentile: Optional[float] = None,
+    threshold_marker: Optional[str] = None,
     save_masks: bool = False,
     mask_basename: str = "superpixel",
     mask_formats: Sequence[str] = ("cellpose", "macsiqview"),
@@ -555,9 +588,11 @@ def compute_superpixel_features_batch(
         markers: Markers to aggregate. If None, uses all channels.
         stats: Statistics per marker.
         remove_empty: Drop empty superpixels.
-        empty_percentile: If given (0-100), adaptive percentile cutoff on
-            total_signal (takes precedence over empty_threshold).
-        empty_threshold: Absolute total_signal cutoff for the empty filter.
+        empty_percentile: If given (0-100), adaptive percentile cutoff on the
+            signal (takes precedence over empty_threshold).
+        empty_threshold: Absolute signal cutoff for the empty filter.
+        threshold_marker: If given, threshold on this marker's mean intensity
+            instead of total_signal.
         save_masks: If True, also write the superpixel masks per ROI (Cellpose
             label TIFF + MacsIQView binary), into ``<rack>/<output_folder>/``.
             Thresholded to match the table when ``remove_empty`` is set.
@@ -634,6 +669,7 @@ def compute_superpixel_features_batch(
                 remove_empty=remove_empty,
                 empty_threshold=empty_threshold,
                 empty_percentile=empty_percentile,
+                threshold_marker=threshold_marker,
                 roi_name=roi_name,
                 output_path=csv_path,
                 save_masks=save_masks,
