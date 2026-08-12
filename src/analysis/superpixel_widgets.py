@@ -95,14 +95,11 @@ class SuperpixelExplorer:
             value=False, description="Remove empty superpixels",
             indent=False, layout=widgets.Layout(width="230px"),
         )
-        self.outline_toggle = widgets.Checkbox(
-            value=True, description="Show grid outlines",
-            indent=False, layout=widgets.Layout(width="180px"),
-        )
-        self.threshold_slider = widgets.FloatSlider(
-            value=0.0, min=0.0, max=float(np.percentile(self._signal_thumb, 99)) or 1.0,
-            step=0.01, description="Empty ≤", continuous_update=False,
-            readout=True, readout_format=".3f", disabled=True,
+        # Adaptive percentile cutoff: drop the lowest-signal N% of superpixels.
+        self.percentile_slider = widgets.FloatSlider(
+            value=25.0, min=0.0, max=100.0, step=1.0,
+            description="Empty pctl", continuous_update=False,
+            readout=True, readout_format=".0f", disabled=True,
             style={"description_width": "90px"},
             layout=widgets.Layout(width="320px"),
         )
@@ -119,8 +116,8 @@ class SuperpixelExplorer:
         self.output = widgets.Output()
 
         controls = widgets.VBox([
-            widgets.HBox([self.size_slider, self.display_dropdown, self.outline_toggle]),
-            widgets.HBox([self.remove_empty_toggle, self.threshold_slider]),
+            widgets.HBox([self.size_slider, self.display_dropdown]),
+            widgets.HBox([self.remove_empty_toggle, self.percentile_slider]),
             widgets.HBox([self.export_button, self.status]),
         ])
         self.main_widget = widgets.VBox([
@@ -132,13 +129,12 @@ class SuperpixelExplorer:
         # Wire callbacks.
         self.size_slider.observe(self._on_change, names="value")
         self.remove_empty_toggle.observe(self._on_toggle_empty, names="value")
-        self.threshold_slider.observe(self._on_change, names="value")
+        self.percentile_slider.observe(self._on_change, names="value")
         self.display_dropdown.observe(self._on_change, names="value")
-        self.outline_toggle.observe(self._on_change, names="value")
         self.export_button.on_click(self._on_export_click)
 
     def _on_toggle_empty(self, change):
-        self.threshold_slider.disabled = not change["new"]
+        self.percentile_slider.disabled = not change["new"]
         self._render()
 
     def _on_change(self, change):
@@ -151,12 +147,15 @@ class SuperpixelExplorer:
             return np.max(list(self._previews.values()), axis=0)
         return self._previews[choice]
 
-    def _empty_cell_flags(self, size: int):
-        """Per-superpixel emptiness on the thumbnail (approximate preview).
+    def _kept_cells(self, size: int):
+        """Compute the kept-superpixel mask on the thumbnail (preview approx).
 
-        Returns (labels, empty_mask_flags, n_total) where flags aligns with the
-        thumbnail grid labels. n_total is the true full-resolution superpixel
-        count.
+        Returns (thumb_labels, kept_img, n_total, kept_fraction):
+        - thumb_labels: thumbnail-resolution grid label image.
+        - kept_img: bool array (thumbnail res), True where the pixel's superpixel
+          is retained under the current percentile cutoff.
+        - n_total: true full-resolution superpixel count.
+        - kept_fraction: fraction of superpixels retained.
         """
         _, n_rows, n_cols = build_superpixel_labels(self.full_shape, size)
         n_total = n_rows * n_cols
@@ -172,10 +171,28 @@ class SuperpixelExplorer:
         with np.errstate(divide="ignore", invalid="ignore"):
             means = np.nan_to_num(sums / counts, nan=0.0)
 
-        threshold = self.threshold_slider.value if self.remove_empty_toggle.value else -1.0
-        empty_per_label = means <= threshold
-        empty_img = empty_per_label[thumb_labels]
-        return empty_img, int((means > threshold).sum()), n_total
+        kept_per_label = np.ones(minlength, dtype=bool)
+        kept_per_label[0] = False  # label 0 is unused (grid tiles from 1)
+        if self.remove_empty_toggle.value:
+            cell_means = means[1:]  # per present superpixel
+            cutoff = np.percentile(cell_means, self.percentile_slider.value)
+            kept_per_label[1:] = cell_means > cutoff
+
+        kept_img = kept_per_label[thumb_labels]
+        kept_fraction = float(kept_per_label[1:].mean()) if minlength > 1 else 1.0
+        return thumb_labels, kept_img, n_total, kept_fraction
+
+    @staticmethod
+    def _cell_border(label_img: np.ndarray) -> np.ndarray:
+        """Boolean mask of superpixel boundary pixels (label differs from a
+        4-neighbor, plus the image edge)."""
+        b = np.zeros(label_img.shape, dtype=bool)
+        b[:, :-1] |= label_img[:, :-1] != label_img[:, 1:]
+        b[:, 1:] |= label_img[:, 1:] != label_img[:, :-1]
+        b[:-1, :] |= label_img[:-1, :] != label_img[1:, :]
+        b[1:, :] |= label_img[1:, :] != label_img[:-1, :]
+        b[0, :] = b[-1, :] = b[:, 0] = b[:, -1] = True
+        return b
 
     def _render(self):
         size = self.size_slider.value
@@ -184,7 +201,10 @@ class SuperpixelExplorer:
         bg = self._background_thumb()
         vmax = np.percentile(bg, 99) or 1.0
 
-        empty_img, kept_thumb, n_total = self._empty_cell_flags(size)
+        thumb_labels, kept_img, n_total, kept_fraction = self._kept_cells(size)
+        # Outline only the retained superpixels; removed blocks lose their grid so
+        # the grid visibly dissolves where superpixels are dropped.
+        outline = self._cell_border(thumb_labels) & kept_img
 
         with self.output:
             self.output.clear_output(wait=True)
@@ -192,30 +212,23 @@ class SuperpixelExplorer:
             fig.canvas.header_visible = False
             ax.imshow(bg, cmap="gray", vmin=0, vmax=vmax, extent=[0, w, h, 0])
 
-            # Shade superpixels that would be removed (semi-transparent red).
-            if self.remove_empty_toggle.value:
-                overlay = np.zeros((*empty_img.shape, 4), dtype=np.float32)
-                overlay[empty_img] = [1.0, 0.0, 0.0, 0.35]
-                ax.imshow(overlay, extent=[0, w, h, 0])
+            overlay = np.zeros((*outline.shape, 4), dtype=np.float32)
+            overlay[outline] = [0.0, 1.0, 1.0, 0.8]  # cyan grid on kept cells
+            ax.imshow(overlay, extent=[0, w, h, 0], interpolation="nearest")
 
-            # Grid lines at multiples of the square size (cheap vlines/hlines).
-            # Hidden when the outline toggle is off so the red "removed" shading
-            # stays visible at small thresholds.
-            if self.outline_toggle.value:
-                xs = np.arange(0, w + 1, size)
-                ys = np.arange(0, h + 1, size)
-                ax.vlines(xs, 0, h, colors="cyan", linewidth=0.5, alpha=0.7)
-                ax.hlines(ys, 0, w, colors="cyan", linewidth=0.5, alpha=0.7)
             ax.set_xlim(0, w)
             ax.set_ylim(h, 0)
             ax.axis("off")
             plt.show()
 
-        kept = kept_thumb if self.remove_empty_toggle.value else n_total
-        self.status.value = (
-            f"<b>{n_total}</b> superpixels ({size}px)"
-            + (f" &middot; keeping <b>{kept}</b> (≈preview)" if self.remove_empty_toggle.value else "")
-        )
+        if self.remove_empty_toggle.value:
+            n_kept = int(round(kept_fraction * n_total))
+            self.status.value = (
+                f"<b>{n_total}</b> superpixels ({size}px) &middot; keeping "
+                f"<b>{n_kept}</b> (~{kept_fraction * 100:.0f}%, ≥{self.percentile_slider.value:.0f}th pctl)"
+            )
+        else:
+            self.status.value = f"<b>{n_total}</b> superpixels ({size}px)"
 
     # -------------------------------------------------------------- export ---
     def export_features(
@@ -246,13 +259,13 @@ class SuperpixelExplorer:
 
         size = self.size_slider.value
         remove_empty = self.remove_empty_toggle.value
-        empty_threshold = self.threshold_slider.value
+        empty_percentile = self.percentile_slider.value if remove_empty else None
 
         df = extract_superpixel_features(
             self.channels,
             size=size,
             remove_empty=remove_empty,
-            empty_threshold=empty_threshold,
+            empty_percentile=empty_percentile,
         )
         self.features_df = df
 
