@@ -6,6 +6,7 @@ feature table. Heavy UI dependencies (ipywidgets, matplotlib) are imported
 lazily so ``analysis.superpixels`` stays importable in headless runs.
 """
 
+import gc
 from typing import Optional, Union
 
 import numpy as np
@@ -27,6 +28,7 @@ from .superpixels import (
     build_superpixel_labels,
     extract_superpixel_features,
     save_superpixel_masks,
+    evict_channel_cache,
     _apply_keep_lut,
 )
 
@@ -87,13 +89,15 @@ class SuperpixelExplorer:
         self._max_proj: Optional[np.ndarray] = None
         self._signal_thumb: Optional[np.ndarray] = None
         for name in self.marker_names:
-            thumb = downsample_image(channels[name], display_target)
+            thumb = self._load_thumb(name, evict=True)
             if self._max_proj is None:
                 self._max_proj = thumb.copy()
                 self._signal_thumb = thumb.astype(np.float32, copy=True)
             else:
                 np.maximum(self._max_proj, thumb, out=self._max_proj)
                 self._signal_thumb += thumb
+            del thumb
+        gc.collect()
         self._preview_shape = self._max_proj.shape
         self._scale_y, self._scale_x = get_preview_scale(
             self.full_shape, self._preview_shape
@@ -196,14 +200,21 @@ class SuperpixelExplorer:
         self._render()
 
     # -------------------------------------------------------------- render ---
+    def _load_thumb(self, name: str, evict: bool = True) -> np.ndarray:
+        """Downsample one channel to a thumbnail, then release the full-res
+        source (drop local ref + evict the OMETiffChannels cache entry) so
+        full-resolution channels never accumulate in memory."""
+        thumb = downsample_image(self.channels[name], self.display_target)
+        if evict:
+            evict_channel_cache(self.channels, name)
+        return thumb
+
     def _get_channel_thumb(self, name: str) -> np.ndarray:
-        """Lazily downsample a single channel, bounded-cached."""
+        """Thumbnail for a single channel, bounded-cached (small thumbnails)."""
         if name not in self._chan_cache:
             if len(self._chan_cache) >= self._chan_cache_max:
                 self._chan_cache.pop(next(iter(self._chan_cache)))  # evict oldest
-            self._chan_cache[name] = downsample_image(
-                self.channels[name], self.display_target
-            )
+            self._chan_cache[name] = self._load_thumb(name, evict=True)
         return self._chan_cache[name]
 
     def _background_thumb(self) -> np.ndarray:
@@ -274,8 +285,15 @@ class SuperpixelExplorer:
         whole session and each interaction only calls ``set_data``/``draw_idle``,
         so figures never accumulate in matplotlib's registry.
         """
+        # Close any prior figure this explorer created before making a new one,
+        # so re-running the cell never leaves orphaned figures in matplotlib's
+        # registry (a classic ipympl memory leak).
+        if self._fig is not None:
+            plt.close(self._fig)
+            self._fig = self._ax = self._bg_img = self._overlay_img = None
         h, w = self.full_shape
         with self.output:
+            self.output.clear_output(wait=True)
             self._fig, self._ax = plt.subplots(figsize=(8, 8 * h / w))
             self._fig.canvas.header_visible = False
             self._fig.canvas.toolbar_visible = False
@@ -358,35 +376,43 @@ class SuperpixelExplorer:
         choice = self.threshold_channel_dropdown.value
         threshold_marker = None if choice == _TOTAL_SIGNAL_OPTION else choice
 
-        df = extract_superpixel_features(
-            self.channels,
-            size=size,
-            remove_empty=remove_empty,
-            empty_threshold=empty_threshold,
-            threshold_marker=threshold_marker,
-        )
-        self.features_df = df
-
-        if output_path is not None:
-            output_path = Path(output_path)
-            output_path.parent.mkdir(parents=True, exist_ok=True)
-            df.to_csv(output_path, index=False)
-
-        self.mask_paths = {}
-        if save_masks:
-            # Rebuild the (thresholded) label image from the computed table; the
-            # kept labels are exactly df["label"].
-            label_img, _, _ = build_superpixel_labels(self.full_shape, size)
-            if remove_empty and "label" in df:
-                label_img = _apply_keep_lut(label_img, df["label"].to_numpy())
-            target_dir = (
-                Path(mask_dir)
-                if mask_dir is not None
-                else (output_path.parent if output_path is not None else Path("."))
+        try:
+            df = extract_superpixel_features(
+                self.channels,
+                size=size,
+                remove_empty=remove_empty,
+                empty_threshold=empty_threshold,
+                threshold_marker=threshold_marker,
             )
-            self.mask_paths = save_superpixel_masks(
-                label_img, target_dir, basename=mask_basename, formats=mask_formats
-            )
+            self.features_df = df
+
+            if output_path is not None:
+                output_path = Path(output_path)
+                output_path.parent.mkdir(parents=True, exist_ok=True)
+                df.to_csv(output_path, index=False)
+
+            self.mask_paths = {}
+            if save_masks:
+                # Rebuild the (thresholded) label image from the computed table;
+                # the kept labels are exactly df["label"].
+                label_img, _, _ = build_superpixel_labels(self.full_shape, size)
+                if remove_empty and "label" in df:
+                    label_img = _apply_keep_lut(label_img, df["label"].to_numpy())
+                target_dir = (
+                    Path(mask_dir)
+                    if mask_dir is not None
+                    else (output_path.parent if output_path is not None else Path("."))
+                )
+                self.mask_paths = save_superpixel_masks(
+                    label_img, target_dir, basename=mask_basename, formats=mask_formats
+                )
+                del label_img
+        finally:
+            # Extraction loads every channel full-res; release them all (the
+            # per-channel eviction already runs during aggregation, this is a
+            # belt-and-suspenders clear) and reclaim memory before returning.
+            evict_channel_cache(self.channels)
+            gc.collect()
 
         return df
 
@@ -405,6 +431,22 @@ class SuperpixelExplorer:
         self._create_figure()
         self._render()
 
+    def close(self):
+        """Release all resources: close the matplotlib figure and free every
+        cached thumbnail and full-res channel. Call before discarding the
+        explorer (re-running the cell does this automatically)."""
+        if self._fig is not None:
+            plt.close(self._fig)
+            self._fig = self._ax = self._bg_img = self._overlay_img = None
+        self._chan_cache.clear()
+        evict_channel_cache(self.channels)
+        gc.collect()
+
+
+# Tracks the most recently created explorer so re-running the notebook cell can
+# tear the previous one down (figure + caches) instead of leaking it.
+_ACTIVE_EXPLORER: Optional["SuperpixelExplorer"] = None
+
 
 def create_superpixel_explorer(
     channels: Union[dict, OMETiffChannels],
@@ -416,6 +458,9 @@ def create_superpixel_explorer(
 ) -> SuperpixelExplorer:
     """Build, display, and return a :class:`SuperpixelExplorer`.
 
+    Re-running this closes the previously created explorer first, so figures and
+    cached channel data don't accumulate across cell re-runs.
+
     Args:
         channels: Dict-like of marker_name -> 2D array (e.g. OMETiffChannels).
         display_target: Longest-edge size of the preview thumbnails.
@@ -425,6 +470,14 @@ def create_superpixel_explorer(
     Returns:
         The live explorer object; call ``.export_features(...)`` after tuning.
     """
+    global _ACTIVE_EXPLORER
+    if _ACTIVE_EXPLORER is not None:
+        try:
+            _ACTIVE_EXPLORER.close()
+        except Exception:
+            pass
+        _ACTIVE_EXPLORER = None
+
     explorer = SuperpixelExplorer(
         channels,
         display_target=display_target,
@@ -434,4 +487,5 @@ def create_superpixel_explorer(
         step=step,
     )
     explorer.display()
+    _ACTIVE_EXPLORER = explorer
     return explorer

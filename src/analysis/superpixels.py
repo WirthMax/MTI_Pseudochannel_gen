@@ -11,6 +11,7 @@ label image plus ``np.bincount`` -- so any grid label image is aggregated in a
 single vectorized pass over each channel.
 """
 
+import gc
 import sys
 from pathlib import Path
 from typing import Optional, Sequence, Union
@@ -75,6 +76,24 @@ def build_superpixel_labels(
     # label = row * n_cols + col + 1  (row-major, 1-based)
     label_img = (row_idx[:, None] * n_cols + col_idx[None, :] + 1).astype(np.int32)
     return label_img, n_rows, n_cols
+
+
+def evict_channel_cache(channels, name: Optional[str] = None) -> None:
+    """Drop cached full-res channel data from an OMETiffChannels-like object.
+
+    ``OMETiffChannels`` caches every channel it loads in ``._cache`` and never
+    evicts, so iterating all channels (feature extraction) or browsing many
+    channels (interactive preview) accumulates full-resolution arrays in memory.
+    This clears one channel (``name``) or the whole cache (``name=None``). It is
+    a no-op for plain dict inputs, which the caller owns.
+    """
+    cache = getattr(channels, "_cache", None)
+    if not isinstance(cache, dict):
+        return
+    if name is None:
+        cache.clear()
+    else:
+        cache.pop(name, None)
 
 
 def _aggregate_regions(
@@ -148,6 +167,12 @@ def _aggregate_regions(
             variance = mean_sq_full[labels] - means * means
             variance = np.clip(variance, 0.0, None)  # guard tiny negatives
             stat_arrays[f"{marker}_std"] = np.sqrt(variance)
+
+        # Free the full-res channel immediately: drop our local reference and
+        # evict it from any OMETiffChannels cache so channels don't accumulate
+        # in memory across the loop (peak stays at ~one full-res channel).
+        del channel_data
+        evict_channel_cache(channels, marker)
 
     return labels, stat_arrays, counts
 
@@ -523,7 +548,10 @@ def compute_superpixel_features(
         )
         shape = channels.shape
     finally:
+        # Drop any cached full-res channels, then close the file handle.
+        evict_channel_cache(channels)
         channels.close()
+        gc.collect()
 
     if output_path is not None:
         output_path = Path(output_path)
@@ -678,6 +706,7 @@ def compute_superpixel_features_batch(
                 mask_formats=mask_formats,
             )
             all_dfs.append(df)
+            gc.collect()  # reclaim per-ROI channel memory before the next ROI
 
         except Exception as e:
             exp_name = exp_info["experiment_path"].name
