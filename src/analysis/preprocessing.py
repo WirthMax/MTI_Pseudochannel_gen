@@ -28,6 +28,11 @@ METADATA_COLUMNS = {
     "solidity",
     "extent",
     "orientation",
+    # superpixel grid metadata (see analysis.superpixels)
+    "tile_row",
+    "tile_col",
+    "n_pixels",
+    "total_signal",
     "cluster",
     "cell_id",
     "sample",

@@ -15,6 +15,13 @@ from .features import (
     extract_features_batch,
 )
 
+from .superpixels import (
+    build_superpixel_labels,
+    extract_superpixel_features,
+    compute_superpixel_features,
+    compute_superpixel_features_batch,
+)
+
 from .preprocessing import (
     METADATA_COLUMNS,
     identify_marker_columns,
@@ -67,6 +74,11 @@ __all__ = [
     "extract_marker_intensities",
     "extract_features",
     "extract_features_batch",
+    # superpixels
+    "build_superpixel_labels",
+    "extract_superpixel_features",
+    "compute_superpixel_features",
+    "compute_superpixel_features_batch",
     # preprocessing
     "METADATA_COLUMNS",
     "identify_marker_columns",
