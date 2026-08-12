@@ -22,7 +22,7 @@ except ImportError:
     plt = None
 
 from pseudochannel.io import OMETiffChannels
-from pseudochannel.preview import create_preview_stack, get_preview_scale
+from pseudochannel.preview import downsample_image, get_preview_scale
 from .superpixels import (
     build_superpixel_labels,
     extract_superpixel_features,
@@ -43,16 +43,21 @@ class SuperpixelExplorer:
     """Interactive superpixel-grid preview with slider-tunable square size.
 
     Displays a downsampled background image with the superpixel grid overlaid.
-    Dragging the size slider re-tiles the grid live; toggling "remove empty"
-    shades the superpixels that would be dropped and reports the kept count.
-    ``export_features`` runs the full-resolution extraction with the current
-    settings.
+    Dragging the size slider re-tiles the grid live; toggling "remove empty" and
+    the percentile slider drops low-signal superpixels, which simply lose their
+    grid outline. ``export_features`` runs the full-resolution extraction with
+    the current settings.
+
+    Efficient like the pseudochannel explorer: the figure and its artists are
+    created once and every interaction only calls ``set_data``/``draw_idle`` (no
+    figure churn), and only two small thumbnails are retained (max-projection +
+    summed signal) rather than a downsampled copy of every channel.
     """
 
     def __init__(
         self,
         channels: Union[dict, OMETiffChannels],
-        display_target: int = 800,
+        display_target: int = 512,
         initial_size: int = 64,
         min_size: int = 8,
         max_size: int = 512,
@@ -61,6 +66,7 @@ class SuperpixelExplorer:
         _check_ipywidgets()
 
         self.channels = channels
+        self.display_target = display_target
         self.full_shape = (
             channels.shape
             if isinstance(channels, OMETiffChannels)
@@ -69,17 +75,33 @@ class SuperpixelExplorer:
         self.marker_names = list(channels.keys())
         self.features_df: Optional[pd.DataFrame] = None
 
-        # Downsample every channel once for a responsive preview.
-        self._previews = create_preview_stack(channels, target_size=display_target)
-        self._preview_shape = next(iter(self._previews.values())).shape
+        # Stream over channels once, keeping only two small thumbnails: the
+        # max-projection (default background) and the summed-signal proxy for
+        # emptiness. Per-channel thumbnails are NOT retained -- individual
+        # channels are downsampled on demand and single-slot cached, so peak
+        # memory stays at one full-res channel + these accumulators.
+        self._max_proj: Optional[np.ndarray] = None
+        self._signal_thumb: Optional[np.ndarray] = None
+        for name in self.marker_names:
+            thumb = downsample_image(channels[name], display_target)
+            if self._max_proj is None:
+                self._max_proj = thumb.copy()
+                self._signal_thumb = thumb.astype(np.float32, copy=True)
+            else:
+                np.maximum(self._max_proj, thumb, out=self._max_proj)
+                self._signal_thumb += thumb
+        self._preview_shape = self._max_proj.shape
         self._scale_y, self._scale_x = get_preview_scale(
             self.full_shape, self._preview_shape
         )
-        # Summed-signal thumbnail used as the emptiness proxy (mirrors
-        # total_signal = sum of per-marker means at full resolution).
-        self._signal_thumb = np.sum(
-            list(self._previews.values()), axis=0
-        ).astype(np.float32)
+        # Single-slot cache for the currently displayed individual channel.
+        self._display_cache: tuple[Optional[str], Optional[np.ndarray]] = (None, None)
+
+        # Persistent figure/artist handles (created once in display()).
+        self._fig = None
+        self._ax = None
+        self._bg_img = None
+        self._overlay_img = None
 
         self._build_widgets(initial_size, min_size, max_size, step)
 
@@ -144,8 +166,13 @@ class SuperpixelExplorer:
     def _background_thumb(self) -> np.ndarray:
         choice = self.display_dropdown.value
         if choice == "max projection":
-            return np.max(list(self._previews.values()), axis=0)
-        return self._previews[choice]
+            return self._max_proj
+        # Lazily downsample the requested channel; single-slot cache so we never
+        # retain more than one per-channel thumbnail.
+        if self._display_cache[0] != choice:
+            thumb = downsample_image(self.channels[choice], self.display_target)
+            self._display_cache = (choice, thumb)
+        return self._display_cache[1]
 
     def _kept_cells(self, size: int):
         """Compute the kept-superpixel mask on the thumbnail (preview approx).
@@ -194,32 +221,53 @@ class SuperpixelExplorer:
         b[0, :] = b[-1, :] = b[:, 0] = b[:, -1] = True
         return b
 
-    def _render(self):
-        size = self.size_slider.value
+    def _create_figure(self):
+        """Create the figure and its two AxesImages once; updates reuse them.
+
+        Mirrors the pseudochannel explorer: the figure and artists live for the
+        whole session and each interaction only calls ``set_data``/``draw_idle``,
+        so figures never accumulate in matplotlib's registry.
+        """
         h, w = self.full_shape
+        with self.output:
+            self._fig, self._ax = plt.subplots(figsize=(8, 8 * h / w))
+            self._fig.canvas.header_visible = False
+            self._fig.canvas.toolbar_visible = False
+            self._fig.canvas.resizable = False
+            blank_bg = np.zeros(self._preview_shape, dtype=np.float32)
+            blank_ov = np.zeros((*self._preview_shape, 4), dtype=np.float32)
+            self._bg_img = self._ax.imshow(
+                blank_bg, cmap="gray", vmin=0, vmax=1, extent=[0, w, h, 0]
+            )
+            self._overlay_img = self._ax.imshow(
+                blank_ov, extent=[0, w, h, 0], interpolation="nearest"
+            )
+            self._ax.set_xlim(0, w)
+            self._ax.set_ylim(h, 0)
+            self._ax.axis("off")
+            self._fig.tight_layout(pad=0)
+            plt.show()
+
+    def _render(self):
+        if self._fig is None:  # figure not created yet
+            return
+        size = self.size_slider.value
 
         bg = self._background_thumb()
-        vmax = np.percentile(bg, 99) or 1.0
+        vmax = float(np.percentile(bg, 99)) or 1.0
 
         thumb_labels, kept_img, n_total, kept_fraction = self._kept_cells(size)
         # Outline only the retained superpixels; removed blocks lose their grid so
         # the grid visibly dissolves where superpixels are dropped.
         outline = self._cell_border(thumb_labels) & kept_img
+        overlay = np.zeros((*outline.shape, 4), dtype=np.float32)
+        overlay[outline] = [0.0, 1.0, 1.0, 0.8]  # cyan grid on kept cells
 
-        with self.output:
-            self.output.clear_output(wait=True)
-            fig, ax = plt.subplots(figsize=(8, 8 * h / w))
-            fig.canvas.header_visible = False
-            ax.imshow(bg, cmap="gray", vmin=0, vmax=vmax, extent=[0, w, h, 0])
-
-            overlay = np.zeros((*outline.shape, 4), dtype=np.float32)
-            overlay[outline] = [0.0, 1.0, 1.0, 0.8]  # cyan grid on kept cells
-            ax.imshow(overlay, extent=[0, w, h, 0], interpolation="nearest")
-
-            ax.set_xlim(0, w)
-            ax.set_ylim(h, 0)
-            ax.axis("off")
-            plt.show()
+        # Update artists in place -- no new figure, no clear_output.
+        self._bg_img.set_data(bg)
+        self._bg_img.set_clim(0, vmax)
+        self._overlay_img.set_data(overlay)
+        self._fig.canvas.draw_idle()
 
         if self.remove_empty_toggle.value:
             n_kept = int(round(kept_fraction * n_total))
@@ -304,12 +352,13 @@ class SuperpixelExplorer:
         """Show the widget and render the initial preview."""
         from IPython.display import display as _display
         _display(self.main_widget)
+        self._create_figure()
         self._render()
 
 
 def create_superpixel_explorer(
     channels: Union[dict, OMETiffChannels],
-    display_target: int = 800,
+    display_target: int = 512,
     initial_size: int = 64,
     min_size: int = 8,
     max_size: int = 512,
