@@ -44,9 +44,9 @@ class SuperpixelExplorer:
 
     Displays a downsampled background image with the superpixel grid overlaid.
     Dragging the size slider re-tiles the grid live; toggling "remove empty" and
-    the percentile slider drops low-signal superpixels, which simply lose their
-    grid outline. ``export_features`` runs the full-resolution extraction with
-    the current settings.
+    the threshold slider drops superpixels whose total signal is at or below the
+    cutoff, which simply lose their grid outline. ``export_features`` runs the
+    full-resolution extraction with the current settings.
 
     Efficient like the pseudochannel explorer: the figure and its artists are
     created once and every interaction only calls ``set_data``/``draw_idle`` (no
@@ -117,11 +117,13 @@ class SuperpixelExplorer:
             value=False, description="Remove empty superpixels",
             indent=False, layout=widgets.Layout(width="230px"),
         )
-        # Adaptive percentile cutoff: drop the lowest-signal N% of superpixels.
-        self.percentile_slider = widgets.FloatSlider(
-            value=25.0, min=0.0, max=100.0, step=1.0,
-            description="Empty pctl", continuous_update=False,
-            readout=True, readout_format=".0f", disabled=True,
+        # Absolute cutoff on per-superpixel total signal. Range spans up to the
+        # 99th percentile of the summed-signal thumbnail (a usable upper bound).
+        thresh_max = float(np.percentile(self._signal_thumb, 99)) or 1.0
+        self.threshold_slider = widgets.FloatSlider(
+            value=0.0, min=0.0, max=thresh_max, step=thresh_max / 200 or 0.01,
+            description="Empty ≤", continuous_update=False,
+            readout=True, readout_format=".3f", disabled=True,
             style={"description_width": "90px"},
             layout=widgets.Layout(width="320px"),
         )
@@ -139,7 +141,7 @@ class SuperpixelExplorer:
 
         controls = widgets.VBox([
             widgets.HBox([self.size_slider, self.display_dropdown]),
-            widgets.HBox([self.remove_empty_toggle, self.percentile_slider]),
+            widgets.HBox([self.remove_empty_toggle, self.threshold_slider]),
             widgets.HBox([self.export_button, self.status]),
         ])
         self.main_widget = widgets.VBox([
@@ -151,12 +153,12 @@ class SuperpixelExplorer:
         # Wire callbacks.
         self.size_slider.observe(self._on_change, names="value")
         self.remove_empty_toggle.observe(self._on_toggle_empty, names="value")
-        self.percentile_slider.observe(self._on_change, names="value")
+        self.threshold_slider.observe(self._on_change, names="value")
         self.display_dropdown.observe(self._on_change, names="value")
         self.export_button.on_click(self._on_export_click)
 
     def _on_toggle_empty(self, change):
-        self.percentile_slider.disabled = not change["new"]
+        self.threshold_slider.disabled = not change["new"]
         self._render()
 
     def _on_change(self, change):
@@ -180,7 +182,7 @@ class SuperpixelExplorer:
         Returns (thumb_labels, kept_img, n_total, kept_fraction):
         - thumb_labels: thumbnail-resolution grid label image.
         - kept_img: bool array (thumbnail res), True where the pixel's superpixel
-          is retained under the current percentile cutoff.
+          is retained under the current absolute total-signal cutoff.
         - n_total: true full-resolution superpixel count.
         - kept_fraction: fraction of superpixels retained.
         """
@@ -201,9 +203,8 @@ class SuperpixelExplorer:
         kept_per_label = np.ones(minlength, dtype=bool)
         kept_per_label[0] = False  # label 0 is unused (grid tiles from 1)
         if self.remove_empty_toggle.value:
-            cell_means = means[1:]  # per present superpixel
-            cutoff = np.percentile(cell_means, self.percentile_slider.value)
-            kept_per_label[1:] = cell_means > cutoff
+            cutoff = self.threshold_slider.value
+            kept_per_label[1:] = means[1:] > cutoff
 
         kept_img = kept_per_label[thumb_labels]
         kept_fraction = float(kept_per_label[1:].mean()) if minlength > 1 else 1.0
@@ -273,7 +274,7 @@ class SuperpixelExplorer:
             n_kept = int(round(kept_fraction * n_total))
             self.status.value = (
                 f"<b>{n_total}</b> superpixels ({size}px) &middot; keeping "
-                f"<b>{n_kept}</b> (~{kept_fraction * 100:.0f}%, ≥{self.percentile_slider.value:.0f}th pctl)"
+                f"<b>{n_kept}</b> (~{kept_fraction * 100:.0f}%, signal &gt; {self.threshold_slider.value:.3f})"
             )
         else:
             self.status.value = f"<b>{n_total}</b> superpixels ({size}px)"
@@ -307,13 +308,13 @@ class SuperpixelExplorer:
 
         size = self.size_slider.value
         remove_empty = self.remove_empty_toggle.value
-        empty_percentile = self.percentile_slider.value if remove_empty else None
+        empty_threshold = self.threshold_slider.value
 
         df = extract_superpixel_features(
             self.channels,
             size=size,
             remove_empty=remove_empty,
-            empty_percentile=empty_percentile,
+            empty_threshold=empty_threshold,
         )
         self.features_df = df
 
