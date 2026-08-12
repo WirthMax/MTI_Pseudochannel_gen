@@ -17,6 +17,8 @@ from .features import (
 
 from .superpixels import (
     build_superpixel_labels,
+    build_superpixel_mask,
+    save_superpixel_masks,
     extract_superpixel_features,
     compute_superpixel_features,
     compute_superpixel_features_batch,
@@ -76,6 +78,8 @@ __all__ = [
     "extract_features_batch",
     # superpixels
     "build_superpixel_labels",
+    "build_superpixel_mask",
+    "save_superpixel_masks",
     "extract_superpixel_features",
     "compute_superpixel_features",
     "compute_superpixel_features_batch",

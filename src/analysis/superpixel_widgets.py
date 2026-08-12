@@ -23,7 +23,12 @@ except ImportError:
 
 from pseudochannel.io import OMETiffChannels
 from pseudochannel.preview import create_preview_stack, get_preview_scale
-from .superpixels import build_superpixel_labels, extract_superpixel_features
+from .superpixels import (
+    build_superpixel_labels,
+    extract_superpixel_features,
+    save_superpixel_masks,
+    _apply_keep_lut,
+)
 
 
 def _check_ipywidgets():
@@ -90,6 +95,10 @@ class SuperpixelExplorer:
             value=False, description="Remove empty superpixels",
             indent=False, layout=widgets.Layout(width="230px"),
         )
+        self.outline_toggle = widgets.Checkbox(
+            value=True, description="Show grid outlines",
+            indent=False, layout=widgets.Layout(width="180px"),
+        )
         self.threshold_slider = widgets.FloatSlider(
             value=0.0, min=0.0, max=float(np.percentile(self._signal_thumb, 99)) or 1.0,
             step=0.01, description="Empty ≤", continuous_update=False,
@@ -110,7 +119,7 @@ class SuperpixelExplorer:
         self.output = widgets.Output()
 
         controls = widgets.VBox([
-            widgets.HBox([self.size_slider, self.display_dropdown]),
+            widgets.HBox([self.size_slider, self.display_dropdown, self.outline_toggle]),
             widgets.HBox([self.remove_empty_toggle, self.threshold_slider]),
             widgets.HBox([self.export_button, self.status]),
         ])
@@ -125,6 +134,7 @@ class SuperpixelExplorer:
         self.remove_empty_toggle.observe(self._on_toggle_empty, names="value")
         self.threshold_slider.observe(self._on_change, names="value")
         self.display_dropdown.observe(self._on_change, names="value")
+        self.outline_toggle.observe(self._on_change, names="value")
         self.export_button.on_click(self._on_export_click)
 
     def _on_toggle_empty(self, change):
@@ -189,10 +199,13 @@ class SuperpixelExplorer:
                 ax.imshow(overlay, extent=[0, w, h, 0])
 
             # Grid lines at multiples of the square size (cheap vlines/hlines).
-            xs = np.arange(0, w + 1, size)
-            ys = np.arange(0, h + 1, size)
-            ax.vlines(xs, 0, h, colors="cyan", linewidth=0.5, alpha=0.7)
-            ax.hlines(ys, 0, w, colors="cyan", linewidth=0.5, alpha=0.7)
+            # Hidden when the outline toggle is off so the red "removed" shading
+            # stays visible at small thresholds.
+            if self.outline_toggle.value:
+                xs = np.arange(0, w + 1, size)
+                ys = np.arange(0, h + 1, size)
+                ax.vlines(xs, 0, h, colors="cyan", linewidth=0.5, alpha=0.7)
+                ax.hlines(ys, 0, w, colors="cyan", linewidth=0.5, alpha=0.7)
             ax.set_xlim(0, w)
             ax.set_ylim(h, 0)
             ax.axis("off")
@@ -208,37 +221,61 @@ class SuperpixelExplorer:
     def export_features(
         self,
         output_path=None,
-        save_labels=None,
+        save_masks: bool = False,
+        mask_dir=None,
+        mask_basename: str = "superpixel",
+        mask_formats=("cellpose", "macsiqview"),
     ) -> pd.DataFrame:
         """Run full-resolution extraction with the current slider settings.
 
         Args:
             output_path: If given, write the feature table CSV here.
-            save_labels: If given, write the grid label image TIFF here.
+            save_masks: If True, also save the superpixel masks (Cellpose label
+                TIFF + MacsIQView binary). When "Remove empty superpixels" is on,
+                the masks are thresholded to match the table.
+            mask_dir: Directory for the mask TIFFs. Defaults to the CSV's parent
+                when ``output_path`` is given, else the current directory.
+            mask_basename: Filename stem for the mask outputs.
+            mask_formats: Which mask formats to write.
 
         Returns:
             The superpixel feature DataFrame (also stored on ``.features_df``).
+            Saved mask paths, if any, are stored on ``.mask_paths``.
         """
-        import tifffile
+        from pathlib import Path
 
         size = self.size_slider.value
-        if save_labels is not None:
-            label_img, _, _ = build_superpixel_labels(self.full_shape, size)
-            tifffile.imwrite(str(save_labels), label_img)
+        remove_empty = self.remove_empty_toggle.value
+        empty_threshold = self.threshold_slider.value
 
         df = extract_superpixel_features(
             self.channels,
             size=size,
-            remove_empty=self.remove_empty_toggle.value,
-            empty_threshold=self.threshold_slider.value,
+            remove_empty=remove_empty,
+            empty_threshold=empty_threshold,
         )
         self.features_df = df
 
         if output_path is not None:
-            from pathlib import Path
             output_path = Path(output_path)
             output_path.parent.mkdir(parents=True, exist_ok=True)
             df.to_csv(output_path, index=False)
+
+        self.mask_paths = {}
+        if save_masks:
+            # Rebuild the (thresholded) label image from the computed table; the
+            # kept labels are exactly df["label"].
+            label_img, _, _ = build_superpixel_labels(self.full_shape, size)
+            if remove_empty and "label" in df:
+                label_img = _apply_keep_lut(label_img, df["label"].to_numpy())
+            target_dir = (
+                Path(mask_dir)
+                if mask_dir is not None
+                else (output_path.parent if output_path is not None else Path("."))
+            )
+            self.mask_paths = save_superpixel_masks(
+                label_img, target_dir, basename=mask_basename, formats=mask_formats
+            )
 
         return df
 

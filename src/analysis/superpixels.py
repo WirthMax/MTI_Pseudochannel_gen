@@ -11,6 +11,7 @@ label image plus ``np.bincount`` -- so any grid label image is aggregated in a
 single vectorized pass over each channel.
 """
 
+import sys
 from pathlib import Path
 from typing import Optional, Sequence, Union
 
@@ -248,6 +249,145 @@ def extract_superpixel_features(
     return df
 
 
+def build_superpixel_mask(
+    channels: Union[dict[str, np.ndarray], OMETiffChannels],
+    size: int,
+    remove_empty: bool = False,
+    empty_threshold: float = 0.0,
+    markers: Optional[list[str]] = None,
+) -> np.ndarray:
+    """Build a superpixel label image, optionally dropping empty regions.
+
+    Each square gets a unique label (row-major, 1..N). When ``remove_empty`` is
+    set, superpixels whose ``total_signal`` (sum of per-marker mean intensities)
+    is ``<= empty_threshold`` are set to 0 (background). Retained superpixels
+    keep their original label IDs, so the mask lines up with the ``label``
+    column of :func:`extract_superpixel_features`.
+
+    Args:
+        channels: Dict-like of marker_name -> 2D array (e.g. OMETiffChannels).
+        size: Superpixel square side length in pixels.
+        remove_empty: If True, zero out empty superpixels.
+        empty_threshold: Threshold on total_signal for the empty filter.
+        markers: Markers used to compute total_signal. If None, uses all.
+
+    Returns:
+        int32 label image of the image shape (0 = background/removed).
+    """
+    if markers is None:
+        markers = list(channels.keys())
+
+    if isinstance(channels, OMETiffChannels):
+        shape = channels.shape
+    else:
+        shape = np.asarray(channels[markers[0]]).shape[:2]
+
+    label_img, _, _ = build_superpixel_labels(tuple(shape), size)
+
+    if not remove_empty:
+        return label_img
+
+    labels, stat_arrays, _ = _aggregate_regions(
+        label_img, channels, markers, stats=("mean",)
+    )
+    if len(labels) == 0:
+        return label_img
+
+    mean_cols = [c for c in stat_arrays if c.endswith("_mean")]
+    if mean_cols:
+        total_signal = np.sum([stat_arrays[c] for c in mean_cols], axis=0)
+    else:
+        total_signal = np.zeros(len(labels), dtype=np.float64)
+
+    keep = labels[total_signal > empty_threshold]
+    return _apply_keep_lut(label_img, keep)
+
+
+def _apply_keep_lut(label_img: np.ndarray, keep_labels: np.ndarray) -> np.ndarray:
+    """Zero out every label not in ``keep_labels`` (preserving kept IDs)."""
+    lut = np.zeros(int(label_img.max()) + 1, dtype=label_img.dtype)
+    keep_labels = np.asarray(keep_labels, dtype=label_img.dtype)
+    lut[keep_labels] = keep_labels
+    return lut[label_img]
+
+
+def save_superpixel_masks(
+    label_img: np.ndarray,
+    output_dir: Union[str, Path],
+    basename: str = "superpixel",
+    formats: Sequence[str] = ("cellpose", "macsiqview"),
+    compress: bool = True,
+) -> dict[str, Path]:
+    """Save a superpixel label image in Cellpose and/or MacsIQView formats.
+
+    - ``cellpose``: a plain label-mask TIFF (uint16, or uint32 when labels
+      exceed 65535). Unique label per superpixel, adjacent squares touching.
+      The label IDs match the feature table's ``label`` column.
+    - ``macsiqview``: the binary separated mask from ``Separate_masks.py`` --
+      1px background gaps carved between differently-labeled neighbors, then
+      binarized to uint8 0/1 (mirrors ``Separate_masks.save_image``).
+
+    Args:
+        label_img: 2D int label image (0 = background).
+        output_dir: Directory to write into (created if missing).
+        basename: Filename stem; outputs are ``{basename}_cellpose.tif`` and
+            ``{basename}_MacsIQView.tif``.
+        formats: Which formats to write (subset of "cellpose", "macsiqview").
+        compress: Write compressed TIFFs.
+
+    Returns:
+        Dict mapping each requested format to the written Path.
+    """
+    valid = {"cellpose", "macsiqview"}
+    invalid = [f for f in formats if f not in valid]
+    if invalid:
+        raise ValueError(f"Unknown mask format(s) {invalid}; valid: {sorted(valid)}")
+
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    compression = "zlib" if compress else None
+    written: dict[str, Path] = {}
+
+    if "cellpose" in formats:
+        max_label = int(label_img.max())
+        dtype = np.uint16 if max_label <= np.iinfo(np.uint16).max else np.uint32
+        cp_path = output_dir / f"{basename}_cellpose.tif"
+        tifffile.imwrite(str(cp_path), label_img.astype(dtype), compression=compression)
+        written["cellpose"] = cp_path
+
+    if "macsiqview" in formats:
+        sep = _separate_borders(label_img.copy())
+        sep[sep != 0] = 1  # binarize, matching Separate_masks CLI behavior
+        mq_path = output_dir / f"{basename}_MacsIQView.tif"
+        tifffile.imwrite(str(mq_path), sep.astype(np.uint8), compression=compression)
+        written["macsiqview"] = mq_path
+
+    return written
+
+
+def _separate_borders(label_img: np.ndarray) -> np.ndarray:
+    """Apply Separate_masks.separation_border_inplace, importing it lazily.
+
+    ``Separate_masks`` is a top-level script under ``src/`` (not part of the
+    ``analysis`` package) and pulls in Numba, so it is imported on demand.
+    """
+    try:
+        from Separate_masks import separation_border_inplace
+    except ImportError:
+        # Ensure src/ (parent of this package) is importable, then retry.
+        src_dir = str(Path(__file__).resolve().parent.parent)
+        if src_dir not in sys.path:
+            sys.path.insert(0, src_dir)
+        try:
+            from Separate_masks import separation_border_inplace
+        except ImportError as e:
+            raise ImportError(
+                "The MacsIQView mask format needs Separate_masks.py (and Numba). "
+                f"Could not import it from {src_dir}: {e}"
+            ) from e
+    return separation_border_inplace(label_img)
+
+
 def compute_superpixel_features(
     image_path: Union[str, Path],
     marker_file: Union[str, Path],
@@ -259,13 +399,16 @@ def compute_superpixel_features(
     empty_threshold: float = 0.0,
     roi_name: Optional[str] = None,
     output_path: Optional[Union[str, Path]] = None,
-    save_labels: Optional[Union[str, Path]] = None,
+    save_masks: bool = False,
+    mask_dir: Optional[Union[str, Path]] = None,
+    mask_basename: str = "superpixel",
+    mask_formats: Sequence[str] = ("cellpose", "macsiqview"),
 ) -> pd.DataFrame:
     """Single-image superpixel feature extraction entry point.
 
     Opens the OME-TIFF lazily (all channels retained -- no default exclusion),
     aggregates superpixel statistics, and optionally writes the feature CSV and
-    the grid label image.
+    the superpixel masks (Cellpose label TIFF + MacsIQView binary).
 
     Args:
         image_path: Path to the OME-TIFF with marker channels.
@@ -278,7 +421,13 @@ def compute_superpixel_features(
         empty_threshold: Threshold on total_signal for the empty filter.
         roi_name: Optional ROI identifier column.
         output_path: If given, write the feature table as CSV here.
-        save_labels: If given, write the int32 grid label image as a TIFF here.
+        save_masks: If True, write the superpixel masks (see mask_* args). When
+            ``remove_empty`` is set, the masks are thresholded to match the table.
+        mask_dir: Directory for the mask TIFFs. Defaults to the CSV's parent
+            when ``output_path`` is given, else the current directory.
+        mask_basename: Filename stem for the mask outputs.
+        mask_formats: Which mask formats to write (subset of "cellpose",
+            "macsiqview").
 
     Returns:
         The superpixel feature DataFrame.
@@ -293,10 +442,6 @@ def compute_superpixel_features(
         exclude_channels=set(),  # keep ALL channels as features
     )
     try:
-        if save_labels is not None:
-            label_img, _, _ = build_superpixel_labels(channels.shape, size)
-            tifffile.imwrite(str(save_labels), label_img)
-
         df = extract_superpixel_features(
             channels,
             size=size,
@@ -306,6 +451,7 @@ def compute_superpixel_features(
             empty_threshold=empty_threshold,
             roi_name=roi_name,
         )
+        shape = channels.shape
     finally:
         channels.close()
 
@@ -313,6 +459,21 @@ def compute_superpixel_features(
         output_path = Path(output_path)
         output_path.parent.mkdir(parents=True, exist_ok=True)
         df.to_csv(output_path, index=False)
+
+    if save_masks:
+        # Rebuild the (thresholded) label image from the computed table -- the
+        # kept labels are exactly df["label"], so no second aggregation pass.
+        label_img, _, _ = build_superpixel_labels(tuple(shape), size)
+        if remove_empty and "label" in df:
+            label_img = _apply_keep_lut(label_img, df["label"].to_numpy())
+        target_dir = (
+            Path(mask_dir)
+            if mask_dir is not None
+            else (output_path.parent if output_path is not None else Path("."))
+        )
+        save_superpixel_masks(
+            label_img, target_dir, basename=mask_basename, formats=mask_formats
+        )
 
     return df
 
@@ -329,8 +490,9 @@ def compute_superpixel_features_batch(
     stats: Sequence[str] = VALID_STATS,
     remove_empty: bool = False,
     empty_threshold: float = 0.0,
-    save_labels: bool = False,
-    label_filename: str = "superpixel_labels.tif",
+    save_masks: bool = False,
+    mask_basename: str = "superpixel",
+    mask_formats: Sequence[str] = ("cellpose", "macsiqview"),
     progress: bool = True,
     save_individual: bool = True,
     overwrite: bool = False,
@@ -355,8 +517,12 @@ def compute_superpixel_features_batch(
         stats: Statistics per marker.
         remove_empty: Drop empty superpixels.
         empty_threshold: Threshold on total_signal for the empty filter.
-        save_labels: If True, also write the grid label TIFF per ROI.
-        label_filename: Filename for the label TIFF when ``save_labels``.
+        save_masks: If True, also write the superpixel masks per ROI (Cellpose
+            label TIFF + MacsIQView binary), into ``<rack>/<output_folder>/``.
+            Thresholded to match the table when ``remove_empty`` is set.
+        mask_basename: Filename stem for the per-ROI mask outputs.
+        mask_formats: Which mask formats to write (subset of "cellpose",
+            "macsiqview").
         progress: Show a tqdm progress bar if available.
         save_individual: Write a CSV per experiment.
         overwrite: If False, skip experiments with an existing output CSV.
@@ -416,9 +582,6 @@ def compute_superpixel_features_batch(
 
             output_dir = exp_info["background_path"].parent / output_folder
             csv_path = output_dir / output_filename if save_individual else None
-            labels_path = (
-                output_dir / label_filename if (save_individual and save_labels) else None
-            )
 
             df = compute_superpixel_features(
                 image_path=exp_info["image_path"],
@@ -431,7 +594,10 @@ def compute_superpixel_features_batch(
                 empty_threshold=empty_threshold,
                 roi_name=roi_name,
                 output_path=csv_path,
-                save_labels=labels_path,
+                save_masks=save_masks,
+                mask_dir=output_dir,
+                mask_basename=mask_basename,
+                mask_formats=mask_formats,
             )
             all_dfs.append(df)
 

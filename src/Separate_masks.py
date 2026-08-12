@@ -54,7 +54,7 @@ def load_image(image_path):
 
 def save_image(output_path, image_array):
     """Save image array as TIFF using tifffile."""
-    tifffile.imwrite(output_path, image_array.astype(np.uint8), compress = True)
+    tifffile.imwrite(output_path, image_array.astype(np.uint8), compression = True)
 
 def main():
     parser = argparse.ArgumentParser(
