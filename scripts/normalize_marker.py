@@ -27,6 +27,7 @@ from __future__ import annotations
 import argparse
 import sys
 import xml.etree.ElementTree as ET
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Sequence
 
@@ -298,9 +299,103 @@ def write_image(img: np.ndarray, output_path: Path) -> None:
         raise ValueError(f"unsupported output extension: {output_path.suffix}")
 
 
-def default_output(input_path: Path, label: str, method: str) -> Path:
-    safe = "".join(c if c.isalnum() else "_" for c in label)
-    return input_path.parent / f"{input_path.stem}_{safe}_{method}.png"
+IMAGE_EXTS = (".tif", ".tiff")
+_IMAGE_STEM_EXTS = (".ome.tif", ".ome.tiff", ".tiff", ".tif")
+
+
+def _safe(text: str) -> str:
+    return "".join(c if c.isalnum() else "_" for c in text)
+
+
+def _image_stem(path: Path) -> str:
+    """Filename without image extension (handles multi-part `.ome.tif`)."""
+    name = path.name
+    for ext in _IMAGE_STEM_EXTS:
+        if name.lower().endswith(ext):
+            return name[: -len(ext)]
+    return path.stem
+
+
+def output_ext(args, explicit: Optional[Path]) -> str:
+    if explicit is not None:
+        return explicit.suffix
+    return ".png" if args.format == "png" else ".tif"
+
+
+def build_output_path(
+    job: "Job", label: str, args, taken: set[Path]
+) -> Path:
+    """Compute the output path for a job (batch-aware, collision-safe)."""
+    ext = output_ext(args, None)
+    suffix = args.suffix if args.suffix is not None else f"_{_safe(label)}_{args.method}"
+    fname = f"{_image_stem(job.input_path)}{suffix}{ext}"
+
+    if args.output_dir is None:
+        # Write next to the source image.
+        return job.input_path.parent / fname
+
+    # Consolidated output dir: disambiguate colliding names with the job prefix.
+    out = args.output_dir / fname
+    if out in taken:
+        out = args.output_dir / f"{_safe(job.prefix)}_{fname}"
+    n = 1
+    while out in taken:
+        out = args.output_dir / f"{_safe(job.prefix)}_{n}_{fname}"
+        n += 1
+    taken.add(out)
+    return out
+
+
+# --------------------------------------------------------------------------- #
+# Batch discovery
+# --------------------------------------------------------------------------- #
+@dataclass
+class Job:
+    """One image to process, with its marker file and a disambiguating prefix."""
+
+    input_path: Path
+    markers_csv: Optional[Path]
+    prefix: str
+
+
+def discover_jobs(
+    input_path: Path,
+    *,
+    mcmicro: bool,
+    glob: str,
+    recursive: bool,
+    markers_csv: Optional[Path],
+) -> list[Job]:
+    """Expand an input path into a list of jobs.
+
+    - A file           -> one job.
+    - A dir + --mcmicro -> reuse find_mcmicro_experiments (per-experiment
+                           image + markers.csv).
+    - A dir (plain)     -> every matching image in the folder (recursive with
+                           --recursive); markers.csv defaults to a sibling.
+    """
+    if input_path.is_file():
+        return [Job(input_path, markers_csv, _image_stem(input_path))]
+
+    if mcmicro:
+        from pseudochannel.batch import find_mcmicro_experiments
+
+        jobs = []
+        for exp in find_mcmicro_experiments(input_path):
+            jobs.append(
+                Job(
+                    input_path=exp["image_path"],
+                    markers_csv=markers_csv or exp["marker_path"],
+                    prefix=exp["experiment_path"].name,
+                )
+            )
+        return jobs
+
+    matches = input_path.rglob(glob) if recursive else input_path.glob(glob)
+    files = sorted(
+        p for p in matches if p.is_file() and p.suffix.lower() in IMAGE_EXTS
+    )
+    return [Job(p, markers_csv, p.parent.name) for p in files]
 
 
 # --------------------------------------------------------------------------- #
@@ -318,16 +413,26 @@ def build_parser() -> argparse.ArgumentParser:
             "  %(prog)s image.ome.tif --channel-index 7 -o plane7.png\n\n"
             "  # brighten dark tissue with gamma, write 16-bit TIFF\n"
             "  %(prog)s image.ome.tif --marker Vimentin --gamma 0.5 -o v.tif\n\n"
+            "  # batch: every TIFF in a folder -> PNGs beside each source\n"
+            "  %(prog)s ./images --marker CD31\n\n"
+            "  # batch: whole MCMICRO tree -> one output dir, per-experiment markers.csv\n"
+            "  %(prog)s ./mcmicro_root --mcmicro --marker CD31 --output-dir ./bg_pngs\n\n"
+            "  # batch with a custom suffix written next to each source\n"
+            "  %(prog)s ./images --channel-index 0 --suffix _bg --format tif\n\n"
             "  # just inspect the available channels\n"
             "  %(prog)s image.ome.tif --list\n"
         ),
     )
-    p.add_argument("input", type=Path, help="Input TIFF / OME-TIFF.")
+    p.add_argument(
+        "input", type=Path,
+        help="Input TIFF/OME-TIFF, OR a directory to batch-process.",
+    )
     p.add_argument(
         "-o", "--output", type=Path, default=None,
-        help="Output path; extension picks the format (.png -> 8-bit, "
-        ".tif/.tiff -> 16-bit). Default: <input>_<marker>_<method>.png next to "
-        "the input.",
+        help="Single-file output path; extension picks the format (.png -> "
+        "8-bit, .tif/.tiff -> 16-bit). Not valid with a directory input (use "
+        "--output-dir / --suffix). Default: <input>_<marker>_<method>.png next "
+        "to the input.",
     )
 
     sel = p.add_argument_group("marker selection")
@@ -378,6 +483,36 @@ def build_parser() -> argparse.ArgumentParser:
         help="Invert intensities (dark tissue on light background).",
     )
 
+    batch = p.add_argument_group("batch (directory input)")
+    batch.add_argument(
+        "--mcmicro", action="store_true",
+        help="Treat the input directory as an MCMICRO tree: process each "
+        "background/ OME-TIFF using its sibling markers.csv.",
+    )
+    batch.add_argument(
+        "--glob", default="*.tif*",
+        help="Glob for images in a plain folder (default: *.tif*). "
+        "Ignored with --mcmicro.",
+    )
+    batch.add_argument(
+        "-r", "--recursive", action="store_true",
+        help="Recurse into subfolders when scanning a plain folder.",
+    )
+    batch.add_argument(
+        "--output-dir", type=Path, default=None,
+        help="Write all outputs into this one directory (names disambiguated "
+        "on collision). Default: beside each source image.",
+    )
+    batch.add_argument(
+        "--suffix", default=None,
+        help="Output filename suffix appended to the source stem "
+        "(default: _<marker>_<method>).",
+    )
+    batch.add_argument(
+        "--format", choices=["png", "tif"], default="png",
+        help="Output format when no explicit -o is given (default: png).",
+    )
+
     p.add_argument(
         "--dtype", choices=["auto", "uint8", "uint16"], default="auto",
         help="Output bit depth (default: auto from extension).",
@@ -388,9 +523,46 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument(
         "--overwrite", action="store_true",
-        help="Overwrite an existing output file (default: refuse).",
+        help="Overwrite existing outputs (default: skip/refuse).",
     )
     return p
+
+
+def process_job(job: Job, args, taken: set[Path], explicit: Optional[Path]) -> str:
+    """Process one image. Returns 'written', 'skipped', or 'failed'."""
+    plane, label = load_marker_plane(
+        job.input_path,
+        marker=args.marker,
+        channel_index=args.channel_index,
+        markers_csv=job.markers_csv,
+        mcmicro_markers=args.mcmicro_markers,
+    )
+
+    output_path = explicit or build_output_path(job, label, args, taken)
+    if output_path.exists() and not args.overwrite:
+        print(f"  skip (exists): {output_path}")
+        return "skipped"
+
+    out_dtype = resolve_dtype(output_path, args.dtype)
+    print(
+        f"  {job.input_path.name} [{label}] {plane.shape} {plane.dtype} "
+        f"-> {args.method} -> {output_path.name} ({out_dtype})"
+    )
+
+    img = normalize_for_display(
+        plane,
+        method=args.method,
+        low=args.low,
+        high=args.high,
+        gamma=args.gamma,
+        clahe_clip=args.clahe_clip,
+        clahe_kernel=args.clahe_kernel,
+        invert=args.invert,
+        dtype=out_dtype,
+    )
+    write_image(img, output_path)
+    print(f"  wrote {output_path} ({output_path.stat().st_size / 1e6:.1f} MB)")
+    return "written"
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
@@ -407,55 +579,64 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         )
         return 2
 
+    is_batch = args.input.is_dir()
+    if is_batch and args.output is not None:
+        print(
+            "error: -o/--output is for a single file; use --output-dir / "
+            "--suffix for a directory input.",
+            file=sys.stderr,
+        )
+        return 2
+
+    jobs = discover_jobs(
+        args.input,
+        mcmicro=args.mcmicro,
+        glob=args.glob,
+        recursive=args.recursive,
+        markers_csv=args.markers_csv,
+    )
+
+    if not jobs:
+        print(f"error: no images found under {args.input}", file=sys.stderr)
+        if is_batch and not args.mcmicro:
+            from pseudochannel.batch import find_mcmicro_experiments
+
+            if find_mcmicro_experiments(args.input):
+                print(
+                    "  hint: this looks like an MCMICRO tree; try --mcmicro.",
+                    file=sys.stderr,
+                )
+        return 2
+
     if args.list_only:
-        list_channels(args.input, args.markers_csv, args.mcmicro_markers)
+        for job in jobs:
+            list_channels(job.input_path, job.markers_csv, args.mcmicro_markers)
         return 0
 
-    try:
-        plane, label = load_marker_plane(
-            args.input,
-            marker=args.marker,
-            channel_index=args.channel_index,
-            markers_csv=args.markers_csv,
-            mcmicro_markers=args.mcmicro_markers,
-        )
-    except (ValueError, IndexError, FileNotFoundError, KeyError) as exc:
-        print(f"error: {exc}", file=sys.stderr)
-        return 2
+    if args.output_dir is not None:
+        args.output_dir.mkdir(parents=True, exist_ok=True)
 
-    output_path = args.output or default_output(args.input, label, args.method)
-    if output_path.exists() and not args.overwrite:
+    if is_batch:
+        print(f"Processing {len(jobs)} image(s) from {args.input}\n")
+
+    taken: set[Path] = set()
+    written = skipped = failed = 0
+    for job in jobs:
+        explicit = args.output if not is_batch else None
+        try:
+            status = process_job(job, args, taken, explicit)
+        except (ValueError, IndexError, FileNotFoundError, KeyError, OSError) as exc:
+            print(f"  ERROR ({job.input_path.name}): {exc}", file=sys.stderr)
+            failed += 1
+            continue
+        written += status == "written"
+        skipped += status == "skipped"
+
+    if is_batch or failed:
         print(
-            f"error: {output_path} exists (use --overwrite).", file=sys.stderr
+            f"\nSummary: {written} written, {skipped} skipped, {failed} failed."
         )
-        return 2
-
-    out_dtype = resolve_dtype(output_path, args.dtype)
-    print(
-        f"  {args.input.name} [{label}] {plane.shape} {plane.dtype} "
-        f"-> {args.method} -> {output_path.name} ({out_dtype})"
-    )
-
-    img = normalize_for_display(
-        plane,
-        method=args.method,
-        low=args.low,
-        high=args.high,
-        gamma=args.gamma,
-        clahe_clip=args.clahe_clip,
-        clahe_kernel=args.clahe_kernel,
-        invert=args.invert,
-        dtype=out_dtype,
-    )
-
-    try:
-        write_image(img, output_path)
-    except (ValueError, OSError) as exc:
-        print(f"error: {exc}", file=sys.stderr)
-        return 2
-
-    print(f"  wrote {output_path} ({output_path.stat().st_size / 1e6:.1f} MB)")
-    return 0
+    return 1 if failed else 0
 
 
 if __name__ == "__main__":
