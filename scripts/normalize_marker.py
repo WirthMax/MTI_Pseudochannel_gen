@@ -328,7 +328,7 @@ def build_output_path(
     """Compute the output path for a job (batch-aware, collision-safe)."""
     ext = output_ext(args, None)
     suffix = args.suffix if args.suffix is not None else f"_{_safe(label)}_{args.method}"
-    fname = f"{_image_stem(job.input_path)}{suffix}{ext}"
+    fname = f"{job.base_stem}{suffix}{ext}"
 
     if args.output_dir is None:
         # Write next to the source image.
@@ -351,11 +351,19 @@ def build_output_path(
 # --------------------------------------------------------------------------- #
 @dataclass
 class Job:
-    """One image to process, with its marker file and a disambiguating prefix."""
+    """One image to process, with its marker file and naming info.
+
+    base_stem is the descriptive filename stem for outputs. For MCMICRO trees
+    it embeds the experiment folder name (the image basenames repeat between
+    experiments, so the basename alone is not unique). prefix is an extra
+    disambiguator used only if two jobs still collide in a consolidated
+    --output-dir.
+    """
 
     input_path: Path
     markers_csv: Optional[Path]
     prefix: str
+    base_stem: str
 
 
 def discover_jobs(
@@ -375,18 +383,26 @@ def discover_jobs(
                            --recursive); markers.csv defaults to a sibling.
     """
     if input_path.is_file():
-        return [Job(input_path, markers_csv, _image_stem(input_path))]
+        stem = _image_stem(input_path)
+        return [Job(input_path, markers_csv, stem, stem)]
 
     if mcmicro:
         from pseudochannel.batch import find_mcmicro_experiments
 
         jobs = []
         for exp in find_mcmicro_experiments(input_path):
+            image_path = exp["image_path"]
+            exp_name = exp["experiment_path"].name
+            img_stem = _image_stem(image_path)
+            # Embed the experiment folder name so outputs stay distinguishable
+            # even when per-ROI image basenames repeat across experiments.
+            base_stem = img_stem if img_stem.startswith(exp_name) else f"{exp_name}_{img_stem}"
             jobs.append(
                 Job(
-                    input_path=exp["image_path"],
+                    input_path=image_path,
                     markers_csv=markers_csv or exp["marker_path"],
-                    prefix=exp["experiment_path"].name,
+                    prefix=exp_name,
+                    base_stem=base_stem,
                 )
             )
         return jobs
@@ -395,7 +411,7 @@ def discover_jobs(
     files = sorted(
         p for p in matches if p.is_file() and p.suffix.lower() in IMAGE_EXTS
     )
-    return [Job(p, markers_csv, p.parent.name) for p in files]
+    return [Job(p, markers_csv, p.parent.name, _image_stem(p)) for p in files]
 
 
 # --------------------------------------------------------------------------- #
