@@ -1202,7 +1202,7 @@ process_roi() {
         if [ "$DRY_RUN" = false ]; then
             log_error "FAILED - MCMICRO failed for $roi_name"
             echo "$roi_name,MCMICRO_FAILED,$(date '+%Y-%m-%d %H:%M:%S')" >> "${LOG_FILE%.log}_summary.csv"
-            cleanup_staged "$staged_dir" "$roi_name"
+            cleanup_staged "$mcmicro_input_dir" "$roi_name"
             cleanup_mcmicro_work "$roi_name"
         fi
         return 1
@@ -1212,11 +1212,11 @@ process_roi() {
         log_success "COMPLETED - Successfully processed $roi_name"
         echo "$roi_name,SUCCESS,$(date '+%Y-%m-%d %H:%M:%S')" >> "${LOG_FILE%.log}_summary.csv"
         if [ "$CLEANUP_STAGED" = true ]; then
-            cleanup_staged "$staged_dir" "$roi_name"
+            cleanup_staged "$mcmicro_input_dir" "$roi_name"
         fi
     else
         if [ "$CLEANUP_STAGED" = true ]; then
-            log_msg "  Would clean up staged data: $staged_dir/raw"
+            log_msg "  Would clean up staged data: $mcmicro_input_dir/raw"
         fi
     fi
     return 0
