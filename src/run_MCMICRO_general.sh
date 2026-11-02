@@ -984,7 +984,7 @@ stage_roi() {
             --bind "$roi_path:/mnt,$output_dir:/media" \
             --no-home \
             "$STAGING_CONTAINER" \
-            python /staging/macsima2mc/macsima2mc.py \
+            macsima2mc \
             -i "/mnt/$cycle_folder" \
             -rm "$REFERENCE_MARKER" \
             -rr \
