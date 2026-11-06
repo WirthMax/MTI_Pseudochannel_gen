@@ -28,6 +28,7 @@ CLEANUP_STAGED=false
 RECOMPUTE=false
 KEEP_DAPI_CYCLES=""   # Comma-separated cycle numbers whose DAPI to keep (cycle 1 always kept)
 KEEP_BACKGROUND_CHANNELS=false
+KEEP_AUTOFLUORESCENCE=false   # Keep one raw AF channel per fluorophore (AF_PE/AF_FITC/AF_APC)
 
 # Config paths (set via CLI flags or environment variables)
 ROOT_DIR="${MCMICRO_ROOT_DIR:-}"
@@ -911,6 +912,73 @@ if kept:
     done < <(find "$staged_dir" -name "markers.csv" -type f)
 }
 
+# Keep one raw autofluorescence channel per fluorophore filter (PE/FITC/APC) in the
+# final stack. macsima2mc emits a 'bg_<cyc>_<marker>-<filter>' row (remove=TRUE) per
+# marker; we promote the earliest-cycle one per filter (least bleached) to AF_<FILTER>
+# and repoint its marker's 'background' column at the new name. Idempotent.
+keep_autofluorescence_channels() {
+    local staged_dir="$1"
+
+    local markers_csv
+    while IFS= read -r markers_csv; do
+        [ -f "$markers_csv" ] || continue
+        python3 -c "
+import csv, sys
+
+path = sys.argv[1]
+FILTERS = ('PE', 'FITC', 'APC')
+
+with open(path) as f:
+    reader = csv.DictReader(f)
+    fieldnames = reader.fieldnames
+    rows = list(reader)
+
+def cycle_of(r):
+    try:
+        return int(r.get('cycle_number', 0))
+    except (ValueError, TypeError):
+        return -1
+
+# bg rows that are still used as background by a marker that is kept in the final stack
+# (skips e.g. cycle-1 rows whose markers were removed in --use-scan-dapi mode)
+used_bg = {r.get('background', '') for r in rows
+           if r.get('background', '') and r.get('remove', '').upper() != 'TRUE'}
+names = {r.get('marker_name', '') for r in rows}
+
+kept, missing = [], []
+for filt in FILTERS:
+    af_name = f'AF_{filt}'
+    if af_name in names:
+        continue  # already promoted on a previous run
+    candidates = [r for r in rows
+                  if r.get('marker_name', '').startswith('bg_')
+                  and r.get('Filter', '').upper() == filt
+                  and cycle_of(r) not in (-1, 999)
+                  and r['marker_name'] in used_bg]
+    if not candidates:
+        missing.append(filt)
+        continue
+    pick = min(candidates, key=cycle_of)
+    old_name = pick['marker_name']
+    pick['marker_name'] = af_name
+    pick['remove'] = ''   # keep in final stack; 'background' stays empty -> raw AF
+    for r in rows:
+        if r.get('background', '') == old_name:
+            r['background'] = af_name
+    kept.append(f'{af_name} (cycle {cycle_of(pick)}, from {old_name})')
+
+if kept:
+    with open(path, 'w', newline='') as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames, lineterminator='\n')
+        writer.writeheader()
+        writer.writerows(rows)
+    print(f'Kept autofluorescence channels: {chr(44).join(chr(32) + k for k in kept).lstrip()}')
+for filt in missing:
+    print(f'WARNING: no {filt} autofluorescence row found in {path}; AF_{filt} not kept')
+" "$markers_csv" 2>&1 | while read -r line; do log_info "$line"; done
+    done < <(find "$staged_dir" -name "markers.csv" -type f)
+}
+
 # Return the highest-exposure directory under base_dir, or base_dir itself.
 get_highest_exposure_dir() {
     local base_dir="$1"
@@ -1183,6 +1251,15 @@ process_roi() {
         fi
     fi
 
+    # Keep one raw autofluorescence channel per fluorophore. Idempotent on re-run.
+    if [ "$KEEP_AUTOFLUORESCENCE" = true ]; then
+        if [ "$DRY_RUN" = true ]; then
+            log_msg "  Would keep one AF channel per fluorophore (AF_PE/AF_FITC/AF_APC) in final stack"
+        else
+            keep_autofluorescence_channels "$staged_dir"
+        fi
+    fi
+
     # Resolve the actual directory to feed into MCMICRO
     local mcmicro_input_dir
     mcmicro_input_dir=$(get_highest_exposure_dir "$staged_dir")
@@ -1334,6 +1411,9 @@ print_config_summary() {
     fi
     if [ -n "$KEEP_DAPI_CYCLES" ]; then
         log_msg "Keep extra DAPI in final stack for cycles: $KEEP_DAPI_CYCLES (as DAPI_cycle<N>; reference cycle 1 always kept)"
+    fi
+    if [ "$KEEP_AUTOFLUORESCENCE" = true ]; then
+        log_msg "Keep autofluorescence: YES (AF_PE/AF_FITC/AF_APC, earliest cycle each)"
     fi
     echo ""
 
@@ -1497,6 +1577,10 @@ while [[ $# -gt 0 ]]; do
             KEEP_DAPI_CYCLES="$2"
             shift 2
             ;;
+        --keep-autofluorescence)
+            KEEP_AUTOFLUORESCENCE=true
+            shift
+            ;;
         --help|-h)
             cat <<EOF
 MACSima Pipeline - Staging and MCMICRO Processing
@@ -1537,6 +1621,8 @@ Optional arguments:
   --keep-dapi <cycles>        Additionally retain these cycles' DAPI in the final stitched
                               stack (comma-separated), each renamed DAPI_cycle<N>. The
                               reference DAPI (cycle 1) is always kept. Does not affect alignment.
+  --keep-autofluorescence     Keep one raw autofluorescence channel per fluorophore (AF_PE,
+                              AF_FITC, AF_APC; earliest cycle each) in the final stack.
   --help, -h                  Show this help message
 
 Examples:
