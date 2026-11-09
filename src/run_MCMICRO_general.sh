@@ -982,20 +982,20 @@ for filt in missing:
 # Return the highest-exposure directory under base_dir, or base_dir itself.
 get_highest_exposure_dir() {
     local base_dir="$1"
-    local highest_raw
+    local highest_markers
 
-    # Find last (highest) raw dir alphabetically — works in both bash and zsh
-    highest_raw=$(find "$base_dir" -type d -name raw 2>/dev/null | sort | tail -n 1)
+    # Locate the exposure dir via markers.csv (not raw/, which --cleanup-staged
+    # deletes). Ignore MCMICRO output subfolders. Last alphabetically = highest.
+    highest_markers=$(find "$base_dir" -type f -name markers.csv \
+        -not -path '*/background/*' -not -path '*/registration/*' \
+        -not -path '*/qc/*' -not -path '*/work/*' 2>/dev/null | sort | tail -n 1)
 
-    if [ -z "$highest_raw" ]; then
+    if [ -z "$highest_markers" ]; then
         echo "$base_dir"
         return 0
     fi
 
-    highest_raw="${highest_raw%/}"
-    local parent_dir="${highest_raw%/*}"
-
-    echo "$parent_dir"
+    echo "${highest_markers%/*}"
 }
 
 #==============================================================================
